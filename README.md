@@ -1,3 +1,9 @@
+> **This is bipnip's fork of Mostro** ([`SovereignTechnology/bipnipd`](https://github.com/SovereignTechnology/bipnipd)),
+> the instance daemon of [bipnip](https://github.com/SovereignTechnology/bipnip): all of Mostro, plus Lightning
+> liquidity leases and rings and node-bound Nostr identities. It is not affiliated with the Mostro project.
+> Upstream: [MostroP2P/mostro](https://github.com/MostroP2P/mostro), forked at v0.20.2 and tracked release by
+> release. License unchanged: GPL-3.0-or-later. Fork status: M0 (nothing here is ready for real funds).
+
 # Mostro 🧌
 
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
