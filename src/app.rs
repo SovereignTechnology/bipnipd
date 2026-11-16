@@ -20,6 +20,7 @@ pub mod dev_fee; // Dev fee payment lifecycle
 pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
+pub mod lease; // bipnip: liquidity lease coordination (no lease money held here)
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
 pub mod payer; // Payer declaration + payment-account history (anti-triangulation)
@@ -286,6 +287,17 @@ async fn handle_message_action_no_ln(
                 .await
                 .map_err(|e| e.into())
         }
+        // bipnip: liquidity leases. The instance checks and relays; it holds
+        // no lease money, and `lease-preimage` is always refused.
+        Action::LeaseOffer
+        | Action::TakeLease
+        | Action::LeaseInvoice
+        | Action::LeaseChannelOpened
+        | Action::LeasePreimage
+        | Action::LeaseActive
+        | Action::LeaseCompletionInvoice => lease::lease_action(ctx, action, msg, event)
+            .await
+            .map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -303,6 +315,13 @@ async fn handle_message_action(
     ln_client: &mut LndConnector,
     ctx: &AppContext,
 ) -> Result<()> {
+    // bipnip: a cancel that names a lease offer never reaches the escrow
+    // cancel path; a lease has no escrow here to cancel.
+    if matches!(action, Action::Cancel) && lease::names_a_lease(ctx, &msg).await {
+        return lease::lease_cancel_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into());
+    }
     match action {
         Action::Release => release_action(ctx, msg, event, my_keys, ln_client)
             .await

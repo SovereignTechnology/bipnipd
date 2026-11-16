@@ -71,7 +71,9 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-mostro-core = { version = "0.17.3", features = ["sqlx"] }
+# bipnip-core main (#4): the mostro-core fork. Mostro's types unchanged, plus node binding, lease
+# terms and lease messages.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "0968228690c3350c2c53dbc479c6c69a6b590ae7", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"
