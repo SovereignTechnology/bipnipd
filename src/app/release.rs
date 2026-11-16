@@ -2465,6 +2465,139 @@ mod tests {
         assert_eq!(db_order.status, Status::FiatSent.to_string());
     }
 
+    /// Counts `settle_hold_invoice` calls and yields inside it, so two
+    /// concurrent releases interleave the way a relay redelivery does.
+    struct CountingSlowEscrow {
+        settles: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EscrowBackend for CountingSlowEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            Ok(("lnbc1".to_string(), vec![0u8; 32], vec![1u8; 32]))
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            self.settles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        }
+
+        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+    }
+
+    /// Issue #904: two concurrent `release` messages for one order must settle
+    /// the hold invoice exactly once, and only the winner notifies the buyer.
+    #[tokio::test]
+    async fn release_action_concurrent_releases_settle_once() {
+        // Arrange
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let my_keys = Keys::generate();
+        let settles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut escrow_a = CountingSlowEscrow {
+            settles: settles.clone(),
+        };
+        let mut escrow_b = CountingSlowEscrow {
+            settles: settles.clone(),
+        };
+
+        // Act: both calls load the order in `FiatSent` before either writes.
+        let (a, b) = tokio::join!(
+            release_action(
+                &ctx,
+                release_message(order.id, None),
+                &event,
+                &my_keys,
+                &mut escrow_a
+            ),
+            release_action(
+                &ctx,
+                release_message(order.id, None),
+                &event,
+                &my_keys,
+                &mut escrow_b
+            ),
+        );
+
+        // Assert: one settle, both callers Ok, one `Released` to the buyer.
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(settles.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let released = queued_actions_for(order.id)
+            .await
+            .into_iter()
+            .filter(|a| *a == Action::Released)
+            .count();
+        assert_eq!(released, 1);
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        let settled_at: Option<i64> =
+            sqlx::query_scalar("SELECT hold_settled_at FROM orders WHERE id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(settled_at.is_some());
+    }
+
+    /// A failed settle hands the claim back, so the seller can release again.
+    #[tokio::test]
+    async fn release_action_can_be_retried_after_a_failed_settle() {
+        // Arrange
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let my_keys = Keys::generate();
+
+        // Act: the first release fails at the node, the second succeeds.
+        let first = release_action(
+            &ctx,
+            release_message(order.id, None),
+            &event,
+            &my_keys,
+            &mut FailingSettleEscrow,
+        )
+        .await;
+        let after_failure = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        let second = release_action(
+            &ctx,
+            release_message(order.id, None),
+            &event,
+            &my_keys,
+            &mut StubEscrow,
+        )
+        .await;
+
+        // Assert
+        assert!(first.is_err());
+        assert_eq!(after_failure.status, Status::FiatSent.to_string());
+        assert!(second.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+    }
+
     #[tokio::test]
     async fn release_action_settles_and_notifies_on_happy_path() {
         // Arrange: non-range order, no buyer invoice (do_payment fails fast).
