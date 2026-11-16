@@ -421,6 +421,18 @@ async fn reconcile_existing_add_column_migration(
     Ok(false)
 }
 
+/// Opens the daemon's SQLite pool.
+pub(crate) async fn open_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    SqlitePool::connect(db_url).await
+}
+
+/// Begins a transaction that will write.
+pub(crate) async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin().await
+}
+
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
@@ -441,7 +453,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
 
         // Create new database connection
-        match SqlitePool::connect(db_url).await {
+        match open_pool(db_url).await {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => {
@@ -492,7 +504,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
     } else {
         // Connect to existing database
-        let conn = SqlitePool::connect(db_url)
+        let conn = open_pool(db_url)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -7351,5 +7363,71 @@ mod migration_and_query_tests {
         assert_eq!(reverted.created_at, 1_700_000_000);
         assert_eq!(reverted.seeded_reviews, 0);
         assert_eq!(reverted.seeded_rating_sum, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod write_contention_tests {
+    //! Issue #954: concurrent read-then-write transactions on the daemon's
+    //! pool must all commit; none may be dropped with `database is locked`.
+
+    use super::{begin_write, open_pool};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_read_then_write_transactions_all_commit() {
+        // Arrange: a file-backed database, as the daemon uses.
+        let dir = std::env::temp_dir().join(format!("mostro-954-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("contention.db");
+        std::fs::File::create_new(&path).unwrap();
+        let url = format!("sqlite://{}", path.display());
+        let pool = open_pool(&url).await.unwrap();
+        sqlx::query("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO counter (id, v) VALUES (1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Act: 8 tasks, 25 read-modify-write transactions each.
+        const TASKS: i64 = 8;
+        const ROUNDS: i64 = 25;
+        let mut handles = Vec::new();
+        for _ in 0..TASKS {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ROUNDS {
+                    let mut tx = begin_write(&pool).await?;
+                    let v: i64 = sqlx::query_scalar("SELECT v FROM counter WHERE id = 1")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    tokio::task::yield_now().await;
+                    sqlx::query("UPDATE counter SET v = ? WHERE id = 1")
+                        .bind(v + 1)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                }
+                Ok::<(), sqlx::Error>(())
+            }));
+        }
+        let mut failures = Vec::new();
+        for h in handles {
+            if let Err(e) = h.await.unwrap() {
+                failures.push(e.to_string());
+            }
+        }
+
+        // Assert: nothing was dropped and no update was lost.
+        let total: i64 = sqlx::query_scalar("SELECT v FROM counter WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "dropped transactions: {failures:?}");
+        assert_eq!(total, TASKS * ROUNDS);
     }
 }
