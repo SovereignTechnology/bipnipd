@@ -58,6 +58,7 @@ pub async fn start_scheduler(ctx: AppContext) {
 
     // Mode-agnostic jobs.
     job_orderbook_reconciler(ctx.clone()).await;
+    job_lease_housekeeping(ctx.clone()).await;
     job_info_event_send(ctx.clone()).await;
     job_health_event_send(ctx.clone()).await;
     job_relay_list(ctx.clone()).await;
@@ -66,6 +67,18 @@ pub async fn start_scheduler(ctx: AppContext) {
     job_refresh_active_pubkeys(ctx.clone()).await;
 
     info!("Scheduler Started");
+}
+
+/// bipnip: once a minute, expire lease offers nobody took, cancel leases that
+/// stalled during setup, and bring public lease order events up to date
+/// (`app::lease::housekeeping_pass`). It touches no escrow and no node.
+async fn job_lease_housekeeping(ctx: AppContext) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            crate::app::lease::housekeeping_pass(&ctx).await;
+        }
+    });
 }
 
 /// Periodically rebuild the protocol-v2 anti-spam gate's active-trade-pubkey

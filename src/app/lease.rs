@@ -11,19 +11,27 @@
 //! ```text
 //! pending -> taken -> invoiced -> opened -> active -> completion
 //!    \________\__________\__________\-> canceled
+//! pending -> expired
 //! ```
 //!
 //! Every step is a compare-and-swap on that column, so a repeated or out-of-order message
 //! changes nothing and relays nothing. Seller steps must come from the identity that made the
 //! offer; identities are the ones the transport proved, and each must be bound to the node the
 //! message names.
+//!
+//! Each offer has a public order event (kind 38735) that follows its state as `pending`,
+//! `in-progress`, `success` or `canceled`. Publishing is best effort when a step is handled, and
+//! the housekeeping job retries whatever is behind. The same job expires offers nobody took and
+//! cancels leases that stalled during setup.
 
 use crate::app::context::AppContext;
 use crate::util::enqueue_order_msg;
 use mostro_core::lease_message::{LeaseOffer, LeasePayload};
+use mostro_core::lease_order::{LeaseOrder, LeaseOrderStatus};
 use mostro_core::prelude::*;
-use nostr_sdk::prelude::PublicKey;
+use nostr_sdk::prelude::{Event, FinalizeEvent, Keys, PublicKey, Timestamp};
 use sqlx::{Row, SqliteConnection, SqlitePool};
+use std::future::Future;
 use uuid::Uuid;
 
 /// Most offers one identity may have open at a time.
@@ -34,6 +42,11 @@ const MAX_OFFER_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 const MAX_CONTRACT_AGE_SECS: u64 = 3600;
 /// How far ahead of this instance's clock a contract may be dated.
 const MAX_CONTRACT_FUTURE_SECS: u64 = 600;
+/// Longest a lease may sit between two setup steps: 48 hours, the longest a hold invoice lives.
+/// A lease with no step for that long is canceled by the housekeeping job.
+const LEASE_SETUP_TIMEOUT_SECS: u64 = 48 * 3600;
+/// Most order events one housekeeping pass brings up to date.
+const MAX_ORDER_EVENTS_PER_PASS: i64 = 100;
 
 const PENDING: &str = "pending";
 const TAKEN: &str = "taken";
@@ -42,6 +55,12 @@ const OPENED: &str = "opened";
 const ACTIVE: &str = "active";
 const COMPLETION: &str = "completion";
 const CANCELED: &str = "canceled";
+/// Nobody took the offer before its expiry. Set by the housekeeping job only.
+const EXPIRED: &str = "expired";
+
+/// One order event is built and sent at a time, so the status a relay holds last is the one
+/// read last.
+static ORDER_EVENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
@@ -192,6 +211,9 @@ async fn lease_offer_action(
     event: &UnwrappedMessage,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
+    if ctx.maintenance().is_enabled() {
+        return Err(refuse(CantDoReason::MaintenanceMode));
+    }
     let kind = msg.get_inner_message_kind();
     let LeasePayload::Offer(offer) = lease_payload(&msg)? else {
         return Err(refuse(CantDoReason::InvalidPayload));
@@ -257,6 +279,7 @@ async fn lease_offer_action(
         None,
     )
     .await;
+    sync_order_event(ctx, id).await;
     Ok(())
 }
 
@@ -271,6 +294,9 @@ async fn take_lease_action(
     event: &UnwrappedMessage,
 ) -> Result<(), MostroError> {
     let pool = ctx.pool();
+    if ctx.maintenance().is_enabled() {
+        return Err(refuse(CantDoReason::MaintenanceMode));
+    }
     let id = order_id(&msg)?;
     let payload = lease_payload(&msg)?;
     let LeasePayload::Take(take) = payload else {
@@ -367,6 +393,7 @@ async fn take_lease_action(
         None,
     )
     .await;
+    sync_order_event(ctx, id).await;
     Ok(())
 }
 
@@ -459,6 +486,7 @@ async fn seller_step(
         None,
     )
     .await;
+    sync_order_event(ctx, id).await;
     Ok(())
 }
 
@@ -513,7 +541,235 @@ pub async fn lease_cancel_action(
     if let Some(other) = other {
         enqueue_order_msg(None, Some(id), Action::Canceled, None, other, None).await;
     }
+    sync_order_event(ctx, id).await;
     Ok(())
+}
+
+/// The status the public order event shows for an internal one.
+fn public_status(status: &str) -> Option<LeaseOrderStatus> {
+    Some(match status {
+        PENDING => LeaseOrderStatus::Pending,
+        TAKEN | INVOICED | OPENED => LeaseOrderStatus::InProgress,
+        ACTIVE | COMPLETION => LeaseOrderStatus::Success,
+        CANCELED => LeaseOrderStatus::Canceled,
+        EXPIRED => LeaseOrderStatus::Expired,
+        _ => return None,
+    })
+}
+
+/// The order event for `offer` under `id`, signed by the instance and dated `at`.
+fn order_event(
+    keys: &Keys,
+    id: Uuid,
+    status: LeaseOrderStatus,
+    offer: &LeaseOffer,
+    at: u64,
+) -> Result<Event, MostroError> {
+    LeaseOrder::from_offer(id, status, offer)
+        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?
+        .to_event_builder()
+        .custom_created_at(Timestamp::from(at))
+        .finalize(keys)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))
+}
+
+/// What one attempt to bring an offer's order event up to date did.
+#[derive(Debug, PartialEq, Eq)]
+enum OrderSync {
+    /// The event was already up to date.
+    Current,
+    /// A new event went out.
+    Published,
+    /// Nothing needed publishing; the row is marked up to date.
+    Skipped,
+}
+
+/// Brings the public order event of offer `id` up to date with its status, sending through
+/// `send`. Nothing is sent when:
+///
+/// - the status changed but the public one did not (`taken` to `invoiced`, say);
+/// - the offer's expiry has passed: the event carries that expiry (NIP-40), so relays have
+///   dropped it and would refuse a new one;
+/// - relays never saw the order and it is already over (canceled before its first publish).
+///
+/// A failed `send` leaves the row behind, and the housekeeping job tries again.
+async fn sync_order_event_with<F, Fut>(
+    pool: &SqlitePool,
+    keys: &Keys,
+    id: Uuid,
+    now: u64,
+    send: F,
+) -> Result<OrderSync, MostroError>
+where
+    F: FnOnce(Event) -> Fut,
+    Fut: Future<Output = Result<(), MostroError>>,
+{
+    let _one_at_a_time = ORDER_EVENTS.lock().await;
+    let row = sqlx::query(
+        "SELECT offer, status, synced_status, order_event_at FROM lease_offers WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let Some(row) = row else {
+        return Ok(OrderSync::Current);
+    };
+    let status: String = row.try_get("status").map_err(db_err)?;
+    let synced: Option<String> = row.try_get("synced_status").map_err(db_err)?;
+    if synced.as_deref() == Some(status.as_str()) {
+        return Ok(OrderSync::Current);
+    }
+    let public = public_status(&status).ok_or_else(|| {
+        MostroInternalErr(ServiceError::UnexpectedError(format!(
+            "lease offer {id} has unknown status {status}"
+        )))
+    })?;
+    let json: String = row.try_get("offer").map_err(db_err)?;
+    let offer: LeaseOffer = serde_json::from_str(&json)
+        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+    let last_at: Option<i64> = row.try_get("order_event_at").map_err(db_err)?;
+
+    // What relays show now, if anything.
+    let shown = synced.as_deref().and_then(public_status);
+    let over = matches!(
+        public,
+        LeaseOrderStatus::Canceled | LeaseOrderStatus::Expired
+    );
+    let nothing_to_send =
+        shown == Some(public) || offer.is_expired(now) || (shown.is_none() && over);
+    let (outcome, event_at) = if nothing_to_send {
+        (OrderSync::Skipped, last_at)
+    } else {
+        // Always newer than the last one, so a relay replaces it even within the same second.
+        let newer_than_last =
+            last_at.map_or(0, |t| u64::try_from(t).unwrap_or(0).saturating_add(1));
+        let at = now.max(newer_than_last);
+        send(order_event(keys, id, public, &offer, at)?).await?;
+        (OrderSync::Published, Some(at as i64))
+    };
+    sqlx::query("UPDATE lease_offers SET synced_status = ?, order_event_at = ? WHERE id = ?")
+        .bind(&status)
+        .bind(event_at)
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(outcome)
+}
+
+/// Brings the order event of offer `id` up to date on this instance's relays. Best effort: a
+/// failure is logged and left to the housekeeping job, and never fails the step that led here.
+async fn sync_order_event(ctx: &AppContext, id: Uuid) {
+    let client = ctx.nostr_client();
+    let synced = sync_order_event_with(ctx.pool(), ctx.keys(), id, now(), |event| async move {
+        crate::publish::send_event_first_ack(client, &event, |_| {}).await
+    })
+    .await;
+    if let Err(e) = synced {
+        tracing::warn!("lease order {id}: order event not published ({e}); housekeeping retries");
+    }
+}
+
+/// One housekeeping pass at `now`:
+///
+/// 1. offers nobody took before their expiry become `expired`;
+/// 2. leases with no setup step for [`LEASE_SETUP_TIMEOUT_SECS`] are canceled and both parties
+///    told. By then the hold invoice has timed out and the buyer has its money back, so this is
+///    bookkeeping; a lease whose seller settled but never reported it active also lands here, and
+///    is no less live between the two nodes for it;
+/// 3. order events that are behind are brought up to date, stopping at the first failure so dead
+///    relays are not hammered.
+async fn housekeeping_pass_with<F, Fut>(
+    pool: &SqlitePool,
+    keys: &Keys,
+    now: u64,
+    mut send: F,
+) -> Result<(), MostroError>
+where
+    F: FnMut(Event) -> Fut,
+    Fut: Future<Output = Result<(), MostroError>>,
+{
+    sqlx::query("UPDATE lease_offers SET status = ? WHERE status = ? AND expires_at <= ?")
+        .bind(EXPIRED)
+        .bind(PENDING)
+        .bind(now as i64)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+
+    let cutoff = now.saturating_sub(LEASE_SETUP_TIMEOUT_SECS) as i64;
+    let rows = sqlx::query(
+        "SELECT o.id AS id, o.seller_trade_pubkey AS seller, l.buyer_trade_pubkey AS buyer \
+         FROM lease_offers o JOIN leases l ON l.offer_id = o.id \
+         WHERE o.status IN (?, ?, ?) AND l.updated_at <= ?",
+    )
+    .bind(TAKEN)
+    .bind(INVOICED)
+    .bind(OPENED)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let mut stalled = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id").map_err(db_err)?;
+        let seller: String = row.try_get("seller").map_err(db_err)?;
+        let buyer: String = row.try_get("buyer").map_err(db_err)?;
+        stalled.push((id, seller, buyer));
+    }
+    for (id, seller, buyer) in stalled {
+        let (Ok(id), Ok(seller), Ok(buyer)) = (
+            Uuid::parse_str(&id),
+            PublicKey::parse(&seller),
+            PublicKey::parse(&buyer),
+        ) else {
+            tracing::warn!("lease housekeeping: skipping a stalled lease with a malformed row");
+            continue;
+        };
+        let moved = {
+            let mut conn = pool.acquire().await.map_err(db_err)?;
+            advance(&mut conn, id, &[TAKEN, INVOICED, OPENED], CANCELED).await?
+        };
+        if moved {
+            for party in [seller, buyer] {
+                enqueue_order_msg(None, Some(id), Action::Canceled, None, party, None).await;
+            }
+        }
+    }
+
+    let rows = sqlx::query(
+        "SELECT id FROM lease_offers WHERE synced_status IS NULL OR synced_status != status \
+         ORDER BY created_at LIMIT ?",
+    )
+    .bind(MAX_ORDER_EVENTS_PER_PASS)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let mut behind = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.try_get("id").map_err(db_err)?;
+        behind.push(id);
+    }
+    for id in behind {
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        sync_order_event_with(pool, keys, id, now, &mut send).await?;
+    }
+    Ok(())
+}
+
+/// One housekeeping pass now, on this instance's relays. Called by the scheduler.
+pub async fn housekeeping_pass(ctx: &AppContext) {
+    let client = ctx.nostr_client();
+    let pass = housekeeping_pass_with(ctx.pool(), ctx.keys(), now(), |event| async move {
+        crate::publish::send_event_first_ack(client, &event, |_| {}).await
+    })
+    .await;
+    if let Err(e) = pass {
+        tracing::warn!("lease housekeeping: pass ended early ({e}); the next one continues");
+    }
 }
 
 #[cfg(test)]
@@ -1190,6 +1446,351 @@ mod tests {
             assert_eq!(refused(result), CantDoReason::NotAllowedByStatus);
         }
         assert_eq!(status(&ctx, id).await, ACTIVE);
+    }
+
+    type Sent = Arc<std::sync::Mutex<Vec<Event>>>;
+
+    /// A `send` that keeps what it is given, or refuses everything.
+    fn sender(
+        sent: &Sent,
+        works: bool,
+    ) -> impl FnMut(Event) -> std::future::Ready<Result<(), MostroError>> {
+        let sent = sent.clone();
+        move |event| {
+            std::future::ready(if works {
+                sent.lock().unwrap().push(event);
+                Ok(())
+            } else {
+                Err(MostroInternalErr(ServiceError::NostrError(
+                    "no relay".into(),
+                )))
+            })
+        }
+    }
+
+    /// One sync of `id` at `at`: what it did and the events it sent.
+    async fn sync_at(ctx: &AppContext, id: Uuid, at: u64) -> (OrderSync, Vec<LeaseOrder>) {
+        let sent = Sent::default();
+        let outcome = sync_order_event_with(ctx.pool(), ctx.keys(), id, at, sender(&sent, true))
+            .await
+            .unwrap();
+        (outcome, orders(ctx, &sent))
+    }
+
+    /// The orders in `sent`, each a valid event signed by the instance.
+    fn orders(ctx: &AppContext, sent: &Sent) -> Vec<LeaseOrder> {
+        sent.lock()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                assert_eq!(event.pubkey, ctx.keys().public_key());
+                LeaseOrder::from_event(event).unwrap()
+            })
+            .collect()
+    }
+
+    async fn pass_at(ctx: &AppContext, at: u64) -> Vec<LeaseOrder> {
+        let sent = Sent::default();
+        housekeeping_pass_with(ctx.pool(), ctx.keys(), at, sender(&sent, true))
+            .await
+            .unwrap();
+        orders(ctx, &sent)
+    }
+
+    async fn synced(ctx: &AppContext, id: Uuid) -> (Option<String>, Option<i64>) {
+        let row =
+            sqlx::query("SELECT synced_status, order_event_at FROM lease_offers WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_one(ctx.pool())
+                .await
+                .unwrap();
+        (row.get("synced_status"), row.get("order_event_at"))
+    }
+
+    // The handlers also try to publish, on a client with no relay: that fails at once and
+    // leaves the row behind, which is where each of these tests starts.
+
+    #[tokio::test]
+    async fn the_order_event_follows_the_lease_and_is_only_sent_when_it_changes() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, offer) = offered(&ctx, &seller).await;
+        assert_eq!(synced(&ctx, id).await, (None, None));
+        let t = now();
+
+        // A relay that refuses leaves the row behind for the next try.
+        let refused = sync_order_event_with(
+            ctx.pool(),
+            ctx.keys(),
+            id,
+            t,
+            sender(&Sent::default(), false),
+        )
+        .await;
+        assert!(refused.is_err());
+        assert_eq!(synced(&ctx, id).await, (None, None));
+
+        let (outcome, sent) = sync_at(&ctx, id, t).await;
+        assert_eq!(outcome, OrderSync::Published);
+        assert_eq!(
+            sent,
+            vec![LeaseOrder::from_offer(id, LeaseOrderStatus::Pending, &offer).unwrap()]
+        );
+        assert!(sent[0].is_open(t));
+        assert_eq!(
+            synced(&ctx, id).await,
+            (Some(PENDING.to_string()), Some(t as i64))
+        );
+        assert_eq!(sync_at(&ctx, id, t).await, (OrderSync::Current, vec![]));
+
+        // Taken within the same second: the new event is still dated after the last one.
+        let contract = buyer.contract(&offer, 2_000_000);
+        buyer
+            .send(
+                &ctx,
+                Some(id),
+                Action::TakeLease,
+                Some(LeasePayload::Take(buyer.take(&contract))),
+            )
+            .await
+            .unwrap();
+        let (outcome, sent) = sync_at(&ctx, id, t).await;
+        assert_eq!(outcome, OrderSync::Published);
+        assert_eq!(sent[0].status, LeaseOrderStatus::InProgress);
+        assert_eq!(
+            synced(&ctx, id).await,
+            (Some(TAKEN.to_string()), Some(t as i64 + 1))
+        );
+
+        // Steps that do not change the public status send nothing.
+        let steps = [
+            (Action::LeaseInvoice, Some(invoice(&contract)), None),
+            (Action::LeaseChannelOpened, Some(channel(&contract)), None),
+            (Action::LeaseActive, None, Some(LeaseOrderStatus::Success)),
+            (
+                Action::LeaseCompletionInvoice,
+                Some(invoice(&contract)),
+                None,
+            ),
+        ];
+        for (action, payload, published) in steps {
+            seller.send(&ctx, Some(id), action, payload).await.unwrap();
+            let (outcome, sent) = sync_at(&ctx, id, t).await;
+            match published {
+                Some(status) => {
+                    assert_eq!(outcome, OrderSync::Published);
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(sent[0].status, status);
+                }
+                // The handler itself already marked the row up to date, sending nothing.
+                None => assert_eq!((outcome, sent), (OrderSync::Current, vec![])),
+            }
+            assert_eq!(synced(&ctx, id).await.0, Some(status(&ctx, id).await));
+        }
+        assert_eq!(synced(&ctx, id).await.1, Some(t as i64 + 2));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_for_an_order_relays_never_saw_or_have_dropped() {
+        let ctx = ctx().await;
+        let seller = Party::new();
+
+        // Withdrawn before its first publish: no ghost `canceled` order.
+        let (never_seen, _) = offered(&ctx, &seller).await;
+        seller
+            .send(&ctx, Some(never_seen), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            synced(&ctx, never_seen).await,
+            (Some(CANCELED.to_string()), None)
+        );
+        assert_eq!(
+            sync_at(&ctx, never_seen, now()).await,
+            (OrderSync::Current, vec![])
+        );
+
+        // Published, then withdrawn: relays are told.
+        let (seen, offer) = offered(&ctx, &seller).await;
+        assert_eq!(sync_at(&ctx, seen, now()).await.0, OrderSync::Published);
+        seller
+            .send(&ctx, Some(seen), Action::Cancel, None)
+            .await
+            .unwrap();
+        let (outcome, sent) = sync_at(&ctx, seen, now()).await;
+        assert_eq!(outcome, OrderSync::Published);
+        assert_eq!(sent[0].status, LeaseOrderStatus::Canceled);
+
+        // Published, then withdrawn after its expiry: relays dropped the event at the expiry
+        // it carries and would refuse a new one.
+        let (late, _) = offered(&ctx, &seller).await;
+        assert_eq!(sync_at(&ctx, late, now()).await.0, OrderSync::Published);
+        seller
+            .send(&ctx, Some(late), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_at(&ctx, late, offer.expires_at + 60).await,
+            (OrderSync::Skipped, vec![])
+        );
+        assert_eq!(synced(&ctx, late).await.0, Some(CANCELED.to_string()));
+    }
+
+    #[tokio::test]
+    async fn housekeeping_expires_untaken_offers_cancels_stalled_leases_and_catches_up() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let t = now();
+        let last = |inbox: Vec<MessageKind>| inbox.last().map(|k| (k.action.clone(), k.id));
+
+        let (open, offer) = offered(&ctx, &seller).await;
+        let (stalled, _) = taken(&ctx, &seller, &buyer).await;
+        let (live_seller, live_buyer) = (Party::new(), Party::new());
+        let (live, contract) = taken(&ctx, &live_seller, &live_buyer).await;
+        for (action, payload) in [
+            (Action::LeaseInvoice, Some(invoice(&contract))),
+            (Action::LeaseChannelOpened, Some(channel(&contract))),
+            (Action::LeaseActive, None),
+        ] {
+            live_seller
+                .send(&ctx, Some(live), action, payload)
+                .await
+                .unwrap();
+        }
+
+        // A pass now changes no state and publishes the three orders that are behind.
+        let mut sent: Vec<_> = pass_at(&ctx, t)
+            .await
+            .into_iter()
+            .map(|order| (order.id, order.status))
+            .collect();
+        sent.sort_by_key(|(id, _)| *id);
+        let mut expected = vec![
+            (open, LeaseOrderStatus::Pending),
+            (stalled, LeaseOrderStatus::InProgress),
+            (live, LeaseOrderStatus::Success),
+        ];
+        expected.sort_by_key(|(id, _)| *id);
+        assert_eq!(sent, expected);
+        assert_eq!(status(&ctx, open).await, PENDING);
+        assert_eq!(status(&ctx, stalled).await, TAKEN);
+        assert!(pass_at(&ctx, t).await.is_empty(), "nothing is behind now");
+
+        // An hour on, a lease still within its setup window is left alone.
+        assert!(pass_at(&ctx, t + 3600).await.is_empty());
+        assert_eq!(status(&ctx, stalled).await, TAKEN);
+
+        // Past the offer's expiry: the untaken offer expires; nothing is sent for it.
+        assert!(pass_at(&ctx, offer.expires_at).await.is_empty());
+        assert_eq!(status(&ctx, open).await, EXPIRED);
+        assert_eq!(synced(&ctx, open).await.0, Some(EXPIRED.to_string()));
+        assert_eq!(status(&ctx, stalled).await, TAKEN);
+        // An expired offer cannot be taken, whatever clock the taker goes by.
+        let late = buyer.contract(&offer, 2_000_000);
+        let result = buyer
+            .send(
+                &ctx,
+                Some(open),
+                Action::TakeLease,
+                Some(LeasePayload::Take(buyer.take(&late))),
+            )
+            .await;
+        assert_eq!(refused(result), CantDoReason::NotAllowedByStatus);
+
+        // Past the setup window: the stalled lease is canceled and both parties are told; the
+        // active one is not touched.
+        let before = (seller.inbox().await.len(), buyer.inbox().await.len());
+        assert!(pass_at(&ctx, t + LEASE_SETUP_TIMEOUT_SECS + 60)
+            .await
+            .is_empty());
+        assert_eq!(status(&ctx, stalled).await, CANCELED);
+        assert_eq!(status(&ctx, live).await, ACTIVE);
+        assert_eq!(
+            last(seller.inbox().await),
+            Some((Action::Canceled, Some(stalled)))
+        );
+        assert_eq!(
+            last(buyer.inbox().await),
+            Some((Action::Canceled, Some(stalled)))
+        );
+        assert_eq!(
+            (seller.inbox().await.len(), buyer.inbox().await.len()),
+            (before.0 + 1, before.1 + 1)
+        );
+        // A second pass tells nobody again.
+        pass_at(&ctx, t + LEASE_SETUP_TIMEOUT_SECS + 120).await;
+        assert_eq!(
+            (seller.inbox().await.len(), buyer.inbox().await.len()),
+            (before.0 + 1, before.1 + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn housekeeping_stops_at_the_first_refusal_and_resumes_later() {
+        let ctx = ctx().await;
+        let seller = Party::new();
+        let (first, _) = offered(&ctx, &seller).await;
+        let (second, _) = offered(&ctx, &seller).await;
+
+        let result = housekeeping_pass_with(
+            ctx.pool(),
+            ctx.keys(),
+            now(),
+            sender(&Sent::default(), false),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(synced(&ctx, first).await.0, None);
+        assert_eq!(synced(&ctx, second).await.0, None);
+
+        assert_eq!(pass_at(&ctx, now()).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn maintenance_mode_takes_no_new_offers_or_takes_but_lets_leases_finish() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (open, offer) = offered(&ctx, &seller).await;
+        let (id, contract) = taken(&ctx, &seller, &buyer).await;
+        ctx.maintenance().set(ctx.pool(), true, None).await.unwrap();
+
+        let result = seller
+            .send(
+                &ctx,
+                None,
+                Action::LeaseOffer,
+                Some(LeasePayload::Offer(seller.offer())),
+            )
+            .await;
+        assert_eq!(refused(result), CantDoReason::MaintenanceMode);
+        let other = buyer.contract(&offer, 2_000_000);
+        let result = buyer
+            .send(
+                &ctx,
+                Some(open),
+                Action::TakeLease,
+                Some(LeasePayload::Take(buyer.take(&other))),
+            )
+            .await;
+        assert_eq!(refused(result), CantDoReason::MaintenanceMode);
+        assert_eq!(status(&ctx, open).await, PENDING);
+
+        // A lease already under way goes on, and can still be canceled.
+        seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseInvoice,
+                Some(invoice(&contract)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, id).await, INVOICED);
+        seller
+            .send(&ctx, Some(open), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, open).await, CANCELED);
     }
 
     #[tokio::test]
