@@ -506,7 +506,7 @@ pub async fn recompute_experienced(
     min_days: u32,
     now: i64,
 ) -> Result<RecomputeOutcome, MostroError> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     let node_key_id = super::node_key_id(node_keys);
     let discarded = discard_history_of_another_node_key(&mut tx, &node_key_id).await?;
     let generation =

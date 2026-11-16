@@ -222,7 +222,7 @@ async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroErr
         return Ok(());
     }
 
-    let mut tx = pool.begin().await.map_err(|e| {
+    let mut tx = crate::db::begin_write(pool).await.map_err(|e| {
         MostroInternalErr(ServiceError::DbAccessError(format!(
             "Failed to begin transaction: {}",
             e
@@ -421,16 +421,36 @@ async fn reconcile_existing_add_column_migration(
     Ok(false)
 }
 
-/// Opens the daemon's SQLite pool.
+/// How long a connection waits for the write lock before giving up.
+const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Opens the daemon's SQLite pool (issue #954): write-ahead logging, so
+/// readers never block the one writer; `synchronous = NORMAL`, which is
+/// durable across application crashes under WAL; and an explicit busy
+/// timeout, so a writer queues for the lock instead of failing at once.
 pub(crate) async fn open_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    SqlitePool::connect(db_url).await
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+    use std::str::FromStr;
+
+    let options = SqliteConnectOptions::from_str(db_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(DB_BUSY_TIMEOUT);
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
 }
 
-/// Begins a transaction that will write.
+/// Begins a transaction that will write, taking the write lock up front
+/// (`BEGIN IMMEDIATE`). A deferred transaction that reads first and writes
+/// later is refused with `database is locked` the moment another writer got
+/// in between, and the busy timeout does not apply to that refusal: that is
+/// how issue #954 dropped a buyer's `fiat-sent`. An immediate transaction
+/// queues on the lock instead.
 pub(crate) async fn begin_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, Sqlite>, sqlx::Error> {
-    pool.begin().await
+    pool.begin_with("BEGIN IMMEDIATE").await
 }
 
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
@@ -723,8 +743,7 @@ pub async fn update_order_to_initial_state(
     let preimage: Option<String> = None;
     let buyer_invoice: Option<String> = None;
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query(
@@ -2090,7 +2109,7 @@ pub async fn move_reputation_binding_once(
     valid_until: i64,
 ) -> Result<bool, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     // A write first: it takes SQLite's writer lock, so racing moves run one
     // after the other.
     sqlx::query(
@@ -2147,7 +2166,7 @@ pub async fn record_reputation_issuer_key(
     seen_at: i64,
 ) -> Result<Option<String>, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     let bound: Option<String> =
         sqlx::query_scalar("SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1")
             .bind(issuer_key)

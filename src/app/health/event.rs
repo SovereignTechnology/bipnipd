@@ -246,8 +246,7 @@ async fn commit(tx: sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(), MostroErr
 
 /// Persist `seq` and `created_at` together, before the event goes out.
 pub async fn save_stamp(pool: &SqlitePool, stamp: Stamp) -> Result<(), MostroError> {
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     daemon_state::set_in(&mut tx, KEY_SEQ, &stamp.seq.to_string()).await?;
@@ -257,8 +256,7 @@ pub async fn save_stamp(pool: &SqlitePool, stamp: Stamp) -> Result<(), MostroErr
 
 /// Persist the relay outage timestamps together.
 pub async fn save_relay_outage(pool: &SqlitePool, outage: RelayOutage) -> Result<(), MostroError> {
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     daemon_state::set_in(

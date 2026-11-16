@@ -67,7 +67,7 @@ async fn revert(
     row: &ReputationImportRow,
 ) -> Result<Option<RevertedImport>, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     // Write first: acquire SQLite's writer lock before reading the user,
     // avoiding a read-to-write upgrade on a stale snapshot. The deletion
     // and aggregate update roll back together if any later step fails.

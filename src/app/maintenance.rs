@@ -201,8 +201,7 @@ impl MaintenanceState {
         } else {
             String::new()
         };
-        let mut tx = pool
-            .begin()
+        let mut tx = crate::db::begin_write(pool)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
         daemon_state::set_in(&mut tx, KEY_ENABLED, if enabled { "1" } else { "0" }).await?;
