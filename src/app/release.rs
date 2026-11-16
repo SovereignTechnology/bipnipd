@@ -372,39 +372,74 @@ pub async fn release_action(
         .get_next_trade_key()
         .map_err(MostroInternalErr)?;
 
-    // Settle seller hold invoice
-    settle_seller_hold_invoice(event, escrow, Action::Released, false, &order).await?;
+    // Claim the transition BEFORE touching Lightning (issue #904). The status
+    // pre-check above is a plain read: two concurrent `release` messages (a
+    // client retry, a relay redelivery) both pass it. Only the caller whose
+    // compare-and-swap moves the row out of `FiatSent`/`Dispute` may settle;
+    // the loser returns without settling, notifying or paying.
+    let prior_status = order.status.clone();
+    let claimed = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status IN (?, ?)")
+        .bind(Status::SettledHoldInvoice.to_string())
+        .bind(order.id)
+        .bind(Status::FiatSent.to_string())
+        .bind(Status::Dispute.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        .rows_affected()
+        == 1;
+    if !claimed {
+        tracing::warn!(
+            "Order {} release skipped: another release already claimed it",
+            order.id
+        );
+        return Ok(());
+    }
+
+    // Settle seller hold invoice. If it fails, nothing irreversible has
+    // happened and nothing was published, so hand the claim back: the seller
+    // can retry, instead of the order sitting in `SettledHoldInvoice` with an
+    // unsettled invoice until its CLTV expires. The give-back is itself a
+    // compare-and-swap (only our own untouched claim is undone).
+    if let Err(e) = settle_seller_hold_invoice(event, escrow, Action::Released, false, &order).await
+    {
+        let reverted = sqlx::query(
+            "UPDATE orders SET status = ? WHERE id = ? AND status = ? AND hold_settled_at IS NULL",
+        )
+        .bind(&prior_status)
+        .bind(order.id)
+        .bind(Status::SettledHoldInvoice.to_string())
+        .execute(pool)
+        .await;
+        if !matches!(&reverted, Ok(r) if r.rows_affected() == 1) {
+            tracing::error!(
+                "Order {}: hold invoice settle failed and the release claim could not be handed back",
+                order.id
+            );
+        }
+        return Err(e);
+    }
+    // The invoice is settled: record it before anything that can fail.
+    sqlx::query("UPDATE orders SET hold_settled_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now().timestamp())
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     // Update order event with status SettledHoldInvoice
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // Persist the status change to DB before calling do_payment.
-    // do_payment spawns async tasks that capture an Order copy; without this
-    // explicit write the settled-hold-invoice status only lived in memory and
-    // was persisted as a side-effect of the full-row writes in
-    // check_failure_retries / payment_success (now replaced by targeted updates).
-    let result = sqlx::query(
-        "UPDATE orders SET status = ?, event_id = ?, hold_settled_at = ? \
-             WHERE id = ? AND status IN (?, ?)",
-    )
-    .bind(&order.status)
-    .bind(&order.event_id)
-    .bind(chrono::Utc::now().timestamp())
-    .bind(order.id)
-    .bind(Status::FiatSent.to_string())
-    .bind(Status::Dispute.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order.id
-        );
-        return Ok(());
-    }
+    // Patch `event_id` only: a full-row write here could clobber a concurrent
+    // path's write made during the Nostr publish.
+    sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+        .bind(&order.event_id)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation. `Released`, not `Settled`:
