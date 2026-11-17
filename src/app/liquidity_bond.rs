@@ -49,6 +49,8 @@ use uuid::Uuid;
 
 /// A bond of a ring member.
 pub const RING: &str = "ring";
+/// The bond of a lease's buyer.
+pub const LEASE: &str = "lease";
 
 /// The invoice was sent; the payment has not arrived.
 pub const REQUESTED: &str = "requested";
@@ -82,13 +84,23 @@ pub struct LiquiditySettings {
     /// payments for up to the ring's window.
     #[serde(default)]
     pub bonds: bool,
-    /// The largest bond a ring on this instance may ask of each member, in satoshi.
+    /// The largest bond a ring on this instance may ask of each member, or a lease of its
+    /// buyer, in satoshi.
     #[serde(default = "default_max_bond_sat")]
     pub max_bond_sat: u64,
+    /// How long a lease buyer's bond may stay locked, in seconds, counted from the take: the
+    /// time the lease has to become active. One minute to 48 hours; 48 hours by default, the
+    /// longest a lease's own hold invoice lives.
+    #[serde(default = "default_lease_bond_window_secs")]
+    pub lease_bond_window_secs: u64,
 }
 
 fn default_max_bond_sat() -> u64 {
     1_000_000
+}
+
+fn default_lease_bond_window_secs() -> u64 {
+    48 * 3_600
 }
 
 impl Default for LiquiditySettings {
@@ -96,6 +108,7 @@ impl Default for LiquiditySettings {
         LiquiditySettings {
             bonds: false,
             max_bond_sat: default_max_bond_sat(),
+            lease_bond_window_secs: default_lease_bond_window_secs(),
         }
     }
 }
@@ -113,7 +126,13 @@ static SETTINGS: OnceLock<LiquiditySettings> = OnceLock::new();
 pub fn parse_settings(toml_text: &str) -> Result<LiquiditySettings, MostroError> {
     let file: SettingsFile = toml::from_str(toml_text)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(format!("[liquidity]: {e}"))))?;
-    Ok(file.liquidity.unwrap_or_default())
+    let settings = file.liquidity.unwrap_or_default();
+    if !(60..=default_lease_bond_window_secs()).contains(&settings.lease_bond_window_secs) {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "[liquidity]: lease_bond_window_secs must be 60 to 172800".to_string(),
+        )));
+    }
+    Ok(settings)
 }
 
 /// Reads and keeps the `[liquidity]` section. Called once, when the settings file is loaded.
@@ -134,7 +153,7 @@ pub fn settings() -> LiquiditySettings {
 pub fn settings() -> LiquiditySettings {
     SETTINGS.get().cloned().unwrap_or(LiquiditySettings {
         bonds: true,
-        max_bond_sat: default_max_bond_sat(),
+        ..LiquiditySettings::default()
     })
 }
 
@@ -1758,6 +1777,13 @@ mod tests {
 
         // A misspelt key is an error, not a silent default.
         assert!(parse_settings("[liquidity]\nbond = true\n").is_err());
+
+        // The lease bond window: 48 hours unless set, and never outside a minute to 48 hours.
+        assert_eq!(on.lease_bond_window_secs, 172_800);
+        let short = parse_settings("[liquidity]\nlease_bond_window_secs = 120\n").unwrap();
+        assert_eq!(short.lease_bond_window_secs, 120);
+        assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 59\n").is_err());
+        assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 172801\n").is_err());
     }
 
     #[tokio::test]

@@ -439,7 +439,16 @@ lnd_resynced_clear_after = 300
 # it on to the member that was let down. The node also publishes a binding of
 # its key to this instance's Nostr key, so members can check who they pay.
 #
+# The same switch lets a lease offer ask its buyer for a bond: locked at the
+# take, returned when the lease becomes active or ends before the seller
+# reported a channel, and paid on to the seller when the seller's channel is in
+# this node's graph and the lease still never became active.
+#
 # [liquidity]
 # bonds = false
-# # Largest bond a ring on this instance may ask of each member, in satoshi.
+# # Largest bond a ring may ask of each member, or a lease of its buyer, in
+# # satoshi.
 # max_bond_sat = 1000000
+# # How long a lease buyer's bond may stay locked, counted from the take, in
+# # seconds: 60 to 172800 (48 hours, the default).
+# lease_bond_window_secs = 172800

@@ -1399,11 +1399,14 @@ async fn bond_work(pool: &SqlitePool) -> Result<bool, MostroError> {
         .await
         .map_err(db_err)?;
     let bonding: i64 = row.try_get("n").map_err(db_err)?;
-    Ok(bonding > 0 || liquidity_bond::any_open(pool).await?)
+    Ok(bonding > 0
+        || crate::app::lease::bonding_count(pool).await? > 0
+        || liquidity_bond::any_open(pool).await?)
 }
 
-/// One pass over the bonds now, on this instance's node. Called by the scheduler, more often
-/// than the full housekeeping pass: a ring opens as soon as its last bond is seen locked.
+/// One pass over the bonds now, of rings and of leases, on this instance's node. Called by the
+/// scheduler, more often than the full housekeeping pass: a ring opens, and a take goes to its
+/// seller, as soon as the bond is seen locked.
 pub async fn bond_pass_now(ctx: &AppContext) {
     let pool = ctx.pool();
     let pass = async {
@@ -1412,6 +1415,11 @@ pub async fn bond_pass_now(ctx: &AppContext) {
             return Ok(());
         }
         let node = liquidity_bond::node().await?;
+        // Rings and leases are passed over separately: a problem with one does not hold up
+        // the other.
+        if let Err(e) = crate::app::lease::bond_pass(pool, &*node, now()).await {
+            tracing::warn!("lease bonds: pass ended early ({e}); the next one continues");
+        }
         bond_pass(pool, &*node, now()).await
     };
     if let Err::<(), MostroError>(e) = pass.await {
