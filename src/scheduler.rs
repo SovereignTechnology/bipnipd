@@ -72,14 +72,26 @@ pub async fn start_scheduler(ctx: AppContext) {
 /// bipnip: once a minute, expire lease offers nobody took, cancel leases that
 /// stalled during setup, expire rings that did not fill, close rings whose
 /// window ended, and bring the public order events up to date
-/// (`app::lease::housekeeping_pass`, `app::ring::housekeeping_pass`). It
-/// touches no escrow and no node.
+/// (`app::lease::housekeeping_pass`, `app::ring::housekeeping_pass`). That
+/// part touches no escrow and no node.
+///
+/// Every ten seconds it also brings ring bonds forward
+/// (`app::ring::bond_pass_now`): the one liquidity step that uses this
+/// instance's node, and only on an instance whose operator turned bonds on
+/// (`[liquidity]` in settings.toml). Such an instance also publishes its
+/// node binding here, once per run.
 async fn job_lease_housekeeping(ctx: AppContext) {
     tokio::spawn(async move {
+        let mut tick: u64 = 0;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            crate::app::lease::housekeeping_pass(&ctx).await;
-            crate::app::ring::housekeeping_pass(&ctx).await;
+            crate::app::liquidity_bond::publish_node_binding(&ctx).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tick += 1;
+            crate::app::ring::bond_pass_now(&ctx).await;
+            if tick.is_multiple_of(6) {
+                crate::app::lease::housekeeping_pass(&ctx).await;
+                crate::app::ring::housekeeping_pass(&ctx).await;
+            }
         }
     });
 }

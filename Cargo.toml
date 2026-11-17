@@ -71,9 +71,12 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-# bipnip-core main (#7): the mostro-core fork. Mostro's types unchanged, plus node binding, leases
+# bipnip-core main (#8): the mostro-core fork. Mostro's types unchanged, plus node binding, leases
 # and rings (terms, messages and the public order events).
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "13355e32e7afc68ef2042220fb67dfbf49fbc6c3", features = ["sqlx"] }
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "752279d811753ce95dec1fdf8cceb5e217d08f33", features = ["sqlx"] }
+# bipnip: node access for liquidity bonds (hold invoices, payments, graph). The same trait and LND
+# backend the agent uses; inherited escrow keeps its own LndConnector.
+bipnip-ln = { git = "https://github.com/SovereignTechnology/bipnip", rev = "d52d3750b1891e96648209970687945621ad1921", features = ["lnd"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 async-trait = "0.1.83"

@@ -1,14 +1,17 @@
 //! bipnip: liquidity ring coordination (bipnip repo, `docs/nips/liquidity-rings.md`).
 //!
 //! The instance fills a ring's slots, fixes the order of its members, collects their commits and
-//! relays their channel reports. No money moves through it and nothing here holds any: every
-//! member opens a channel from its own node to the next member.
+//! relays their channel reports. No channel money moves through it: every member opens a channel
+//! from its own node to the next member. The one thing it may hold is a bond, when the ring asks
+//! for one (below, and `app::liquidity_bond`).
 //!
 //! A ring's state lives in `ring_offers.status`:
 //!
 //! ```text
-//! pending -> committing -> open -> success
-//!    |            \_________\----> partial     (the window ended)
+//! pending -> committing -> [bonding ->] open -> success
+//!    |            \             \          \----> partial     (the window ended)
+//!    |             \             \-> canceled               (a bond was not paid)
+//!    |              \-> partial                             (the window ended)
 //!    \-> canceled | expired
 //! ```
 //!
@@ -19,6 +22,18 @@
 //! - `open`: every member has committed; all commits were sent to all members. Members open
 //!   their channel and report it; the member opened to confirms.
 //! - `success`: every channel was confirmed. `partial`: the window ended first.
+//! - `bonding` (rings with a bond only): every member has committed and was sent a hold invoice
+//!   on this instance's node for the bond. Nobody is told to open until every bond is locked. A
+//!   bond not paid within the hour cancels the ring, and the bonds already locked go back.
+//!
+//! **Bonds.** When every channel is confirmed, every bond goes back. When the window ends first,
+//! each member's bond is decided on its own: it goes back if the member it opened to confirmed
+//! the channel, or if **this instance's own node** sees that channel in the public graph (a new
+//! channel of the ring's capacity between the two nodes, the one the member reported if it
+//! reported one, and not one another member reported). Otherwise the bond is taken and owed to
+//! the member it should have opened to, who claims it with an invoice. So a member's word alone
+//! never takes another member's bond, and a member that opened is safe from a neighbour that
+//! denies it. While the node cannot be asked, nothing is decided.
 //!
 //! What the instance vouches for is small on purpose. Members check the roster, every binding in
 //! it and every commit themselves, and a channel counts only when the member it was opened to
@@ -28,12 +43,15 @@
 //! slots are taken; it names no member. Publishing follows the same rules as for leases.
 
 use crate::app::context::AppContext;
+use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, RING};
 use crate::util::enqueue_order_msg;
+use bipnip_ln::LightningBackend;
+use mostro_core::bond::bond_cltv_delta;
 use mostro_core::prelude::*;
 use mostro_core::ring::Ring;
 use mostro_core::ring_message::{
-    RingClosed, RingCommitment, RingMessageError, RingOffer, RingOpen, RingPayload, RingRoster,
-    RingSeat,
+    RingClosed, RingCommitment, RingInvoice, RingMessageError, RingOffer, RingOpen, RingPayload,
+    RingRoster, RingSeat,
 };
 use mostro_core::ring_order::{RingOrder, RingOrderStatus};
 use nostr_sdk::prelude::{Event, FinalizeEvent, Keys, PublicKey, Timestamp};
@@ -51,6 +69,7 @@ const MAX_ORDER_EVENTS_PER_PASS: i64 = 100;
 
 const PENDING: &str = "pending";
 const COMMITTING: &str = "committing";
+const BONDING: &str = "bonding";
 const OPEN: &str = "open";
 const SUCCESS: &str = "success";
 const PARTIAL: &str = "partial";
@@ -105,10 +124,18 @@ impl Offer {
 struct Member {
     identity: String,
     trade_pubkey: String,
+    node: String,
     commit_sig: Option<String>,
     edge_txid: Option<String>,
     edge_index: Option<i64>,
     edge_verified: bool,
+}
+
+impl Member {
+    /// The outpoint of the channel this member says it opened, as `txid:index`.
+    fn reported(&self) -> Option<String> {
+        Some(format!("{}:{}", self.edge_txid.as_ref()?, self.edge_index?))
+    }
 }
 
 async fn offer_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Offer>, MostroError> {
@@ -138,7 +165,7 @@ async fn offer_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Offer>, Mostr
 /// A ring's members: in opening order once the roster is fixed, in joining order before.
 async fn members_of(pool: &SqlitePool, id: Uuid) -> Result<Vec<Member>, MostroError> {
     let rows = sqlx::query(
-        "SELECT identity, trade_pubkey, commit_sig, edge_txid, edge_index, edge_verified \
+        "SELECT identity, trade_pubkey, node, commit_sig, edge_txid, edge_index, edge_verified \
          FROM ring_members WHERE ring_offer_id = ? ORDER BY position, joined_at, identity",
     )
     .bind(id.to_string())
@@ -151,6 +178,7 @@ async fn members_of(pool: &SqlitePool, id: Uuid) -> Result<Vec<Member>, MostroEr
         members.push(Member {
             identity: row.try_get("identity").map_err(db_err)?,
             trade_pubkey: row.try_get("trade_pubkey").map_err(db_err)?,
+            node: row.try_get("node").map_err(db_err)?,
             commit_sig: row.try_get("commit_sig").map_err(db_err)?,
             edge_txid: row.try_get("edge_txid").map_err(db_err)?,
             edge_index: row.try_get("edge_index").map_err(db_err)?,
@@ -238,8 +266,9 @@ pub async fn ring_action(
         Action::RingCommit => ring_commit_action(ctx, msg, event).await,
         Action::RingEdgeOpened => ring_edge_opened_action(ctx, msg, event).await,
         Action::RingEdgeVerified => ring_edge_verified_action(ctx, msg, event).await,
-        // The roster, the collected commits and the closing report are the instance's own to
-        // send. One that arrives here is refused unread.
+        Action::RingBondClaim => ring_bond_claim_action(ctx, msg, event).await,
+        // The roster, the collected commits, the bond invoices and the closing report are the
+        // instance's own to send. One that arrives here is refused unread.
         _ => Err(refuse(CantDoReason::InvalidAction)),
     }
 }
@@ -268,6 +297,11 @@ async fn ring_offer_action(
     let now = now();
     if offer.is_expired(now) || offer.expires_at > now.saturating_add(MAX_OFFER_LIFETIME_SECS) {
         return Err(refuse(CantDoReason::InvalidParameters));
+    }
+    // A bond is money this instance would hold: only if its operator turned bonds on, and only
+    // up to the operator's limit.
+    if !liquidity_bond::allowed(&liquidity_bond::settings(), offer.bond_sat) {
+        return Err(refuse(CantDoReason::OutOfRangeSatsAmount));
     }
     let creator = event.identity.to_hex();
     offer
@@ -564,25 +598,41 @@ async fn ring_commit_action(
     }
 
     let members = members_of(pool, id).await?;
-    let mut commits = Vec::with_capacity(members.len());
-    for member in &members {
-        let Some(signature) = &member.commit_sig else {
-            return Ok(());
-        };
-        commits.push(RingCommitment {
-            nostr_pubkey: member.identity.clone(),
-            signature: signature.clone(),
-        });
+    if members.iter().any(|member| member.commit_sig.is_none()) {
+        return Ok(());
+    }
+    if ring.terms.bond_sat > 0 {
+        // Bonds first: nobody is told to open until every member's bond is locked.
+        if advance(pool, id, &[COMMITTING], BONDING).await? {
+            bonding_step_now(pool, id).await;
+        }
+        return Ok(());
     }
     // Only the handler that moves the ring to `open` sends the commits out.
     if !advance(pool, id, &[COMMITTING], OPEN).await? {
         return Ok(());
     }
+    send_open(id, &ring, &members).await
+}
+
+/// Sends every member's commit to every member: the signal to open.
+async fn send_open(id: Uuid, ring: &Ring, members: &[Member]) -> Result<(), MostroError> {
+    let mut commits = Vec::with_capacity(members.len());
+    for member in members {
+        let signature = member
+            .commit_sig
+            .clone()
+            .ok_or_else(|| broken("a ring opens without a commit"))?;
+        commits.push(RingCommitment {
+            nostr_pubkey: member.identity.clone(),
+            signature,
+        });
+    }
     let open = RingOpen {
         ring_id: ring.id(),
         commits,
     };
-    for member in &members {
+    for member in members {
         let payload = RingPayload::Open(open.clone());
         tell(
             &member.trade_pubkey,
@@ -594,6 +644,233 @@ async fn ring_commit_action(
         .await?;
     }
     Ok(())
+}
+
+/// One bonding step now, on this instance's node. Best effort: a failure is logged and the
+/// housekeeping job tries again, and it never fails the commit that led here.
+async fn bonding_step_now(pool: &SqlitePool, id: Uuid) {
+    let step = match liquidity_bond::node().await {
+        Ok(node) => bonding_step(pool, &*node, id, now()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = step {
+        tracing::warn!("ring {id}: bonds not brought forward ({e}); housekeeping retries");
+    }
+}
+
+/// Brings a ring that is collecting bonds forward at `now`:
+///
+/// 1. every member that has none yet gets a bond invoice, while there is still time to pay;
+/// 2. the node is asked which bonds are locked;
+/// 3. with all of them locked, the channels the graph already shows between each member and the
+///    next are written down (they will not count as the opening), and the ring opens;
+/// 4. if the time to pay is over, or the node let a bond go, the ring is canceled and the bonds
+///    already locked go back. The time to pay is an hour, and never past the ring's window.
+async fn bonding_step(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    id: Uuid,
+    now: u64,
+) -> Result<(), MostroError> {
+    let Some(row) = offer_by_id(pool, id).await? else {
+        return Ok(());
+    };
+    if row.status != BONDING {
+        return Ok(());
+    }
+    let ring = row.ring()?;
+    let ring_id = ring.id();
+    let members = members_of(pool, id).await?;
+    let window_end = u64::try_from(row.window_ends_at.unwrap_or(0)).unwrap_or(0);
+
+    let had = liquidity_bond::of_order(pool, RING, id).await?;
+    let started = had
+        .iter()
+        .map(|bond| u64::try_from(bond.created_at).unwrap_or(0))
+        .min()
+        .unwrap_or(now);
+    let pay_by = started.saturating_add(BOND_PAY_WINDOW_SECS).min(window_end);
+    if now < pay_by {
+        let description = format!("bipnip ring bond {}", &ring_id[..16]);
+        for member in &members {
+            if had
+                .iter()
+                .any(|bond| bond.payer_identity == member.identity)
+            {
+                continue;
+            }
+            let request = liquidity_bond::Request {
+                kind: RING,
+                order_id: id,
+                payer_identity: &member.identity,
+                payer_trade_pubkey: &member.trade_pubkey,
+                amount_sat: ring.terms.bond_sat,
+                cltv_delta: bond_cltv_delta(window_end.saturating_sub(now)),
+                description: &description,
+            };
+            let invoice = liquidity_bond::request(pool, node, &request, now).await?;
+            let payload = RingPayload::Invoice(RingInvoice {
+                ring_id: ring_id.clone(),
+                invoice,
+            });
+            tell(
+                &member.trade_pubkey,
+                None,
+                id,
+                Action::RingBondInvoice,
+                Some(payload),
+            )
+            .await?;
+        }
+    }
+
+    let bonds = liquidity_bond::refresh(pool, node, RING, id).await?;
+    let all_locked = bonds.len() == members.len()
+        && bonds
+            .iter()
+            .all(|bond| bond.state == liquidity_bond::LOCKED);
+    // Only while there is still a window to open in: a ring whose bonds lock after its window
+    // (the node could not be asked for that long) is canceled below, and the bonds go back.
+    if all_locked && now < window_end {
+        for (place, member) in members.iter().enumerate() {
+            let next = &members[(place + 1) % members.len()];
+            let before = liquidity_bond::channels_between(
+                node,
+                &member.node,
+                &next.node,
+                ring.terms.capacity_sat,
+            )
+            .await?;
+            let bond = bonds
+                .iter()
+                .find(|bond| bond.payer_identity == member.identity)
+                .ok_or_else(|| broken("a member of a bonded ring has no bond"))?;
+            liquidity_bond::note_graph_before(pool, bond.id, &before).await?;
+        }
+        if advance(pool, id, &[BONDING], OPEN).await? {
+            send_open(id, &ring, &members).await?;
+        }
+        return Ok(());
+    }
+
+    let gone = bonds.iter().any(|bond| {
+        bond.state != liquidity_bond::REQUESTED && bond.state != liquidity_bond::LOCKED
+    });
+    if (now >= pay_by || gone) && advance(pool, id, &[BONDING], CANCELED).await? {
+        liquidity_bond::release_all(pool, node, RING, id).await?;
+        for member in &members {
+            tell(&member.trade_pubkey, None, id, Action::Canceled, None).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Decides every bond of a ring whose window has ended, one member at a time. A member's bond
+/// goes back when the member it opened to confirmed the channel, or when this instance's node
+/// sees the channel in the graph: between the member's node and the next member's, of the
+/// ring's capacity, not there before the ring opened, not a channel another member reported,
+/// and, if the member reported one, that very channel. Otherwise the bond is taken and owed to
+/// the next member. An error (the node cannot be asked) leaves the remaining bonds undecided.
+async fn judge(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    id: Uuid,
+    now: u64,
+) -> Result<(), MostroError> {
+    let Some(row) = offer_by_id(pool, id).await? else {
+        return Ok(());
+    };
+    let ring = row.ring()?;
+    let members = members_of(pool, id).await?;
+    let bonds = liquidity_bond::of_order(pool, RING, id).await?;
+    let reported: Vec<Option<String>> = members.iter().map(Member::reported).collect();
+    for (place, member) in members.iter().enumerate() {
+        let Some(bond) = bonds
+            .iter()
+            .find(|bond| bond.payer_identity == member.identity)
+        else {
+            continue;
+        };
+        if bond.state != liquidity_bond::LOCKED {
+            continue;
+        }
+        let next = &members[(place + 1) % members.len()];
+        let mut kept = member.edge_verified;
+        if !kept {
+            let in_graph = liquidity_bond::channels_between(
+                node,
+                &member.node,
+                &next.node,
+                ring.terms.capacity_sat,
+            )
+            .await?;
+            let counts = |outpoint: &String| {
+                let was_there = bond.graph_before.contains(outpoint);
+                let someone_elses = reported
+                    .iter()
+                    .enumerate()
+                    .any(|(other, theirs)| other != place && theirs.as_ref() == Some(outpoint));
+                !was_there && !someone_elses
+            };
+            kept = match &reported[place] {
+                Some(own) => in_graph
+                    .iter()
+                    .any(|outpoint| outpoint == own && counts(outpoint)),
+                None => in_graph.iter().any(counts),
+            };
+        }
+        if kept {
+            liquidity_bond::release(pool, node, bond.id).await?;
+        } else {
+            liquidity_bond::slash(pool, node, bond.id, &next.identity, &next.trade_pubkey, now)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Lets go every bond of a ring that is still held, now. Best effort: a bond the node could not
+/// be told about is picked up by the housekeeping job.
+async fn release_bonds_now(pool: &SqlitePool, id: Uuid) {
+    let released = async {
+        if liquidity_bond::of_order(pool, RING, id).await?.is_empty() {
+            return Ok(());
+        }
+        let node = liquidity_bond::node().await?;
+        liquidity_bond::release_all(pool, &*node, RING, id).await
+    };
+    if let Err::<(), MostroError>(e) = released.await {
+        tracing::warn!("ring {id}: bonds not released ({e}); housekeeping retries");
+    }
+}
+
+/// A member that is owed a bond sends its invoice for it. Checked here: the ring ended with its
+/// window (`partial`) and the claim names it. Checked by [`liquidity_bond::claim`]: the sender is
+/// the member the taken bond is owed to, and the invoice asks for exactly what is owed.
+async fn ring_bond_claim_action(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedMessage,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+    let id = order_id(&msg)?;
+    let RingPayload::Invoice(claim) = ring_payload(&msg)? else {
+        return Err(refuse(CantDoReason::InvalidPayload));
+    };
+    claim
+        .validate()
+        .map_err(|_| refuse(CantDoReason::InvalidParameters))?;
+    let row = offer_by_id(pool, id)
+        .await?
+        .ok_or(refuse(CantDoReason::NotFound))?;
+    if row.status != PARTIAL {
+        return Err(refuse(CantDoReason::NotAllowedByStatus));
+    }
+    if claim.ring_id != row.ring()?.id() {
+        return Err(refuse(CantDoReason::InvalidParameters));
+    }
+    let sender = event.identity.to_hex();
+    liquidity_bond::claim(pool, RING, id, &sender, &claim.invoice, now()).await
 }
 
 /// The ring, its members and the sender's place among them, for a ring that is open and whose
@@ -637,6 +914,15 @@ async fn ring_edge_opened_action(
         .map_err(|_| refuse(CantDoReason::InvalidParameters))?;
     let (ring, members, place) = open_ring(pool, id, event).await?;
     if edge.ring_id != ring.id() {
+        return Err(refuse(CantDoReason::InvalidParameters));
+    }
+    // One channel is one member's opening: an outpoint another member reported is refused.
+    let outpoint = format!("{}:{}", edge.funding_txid, edge.output_index);
+    let someone_elses = members
+        .iter()
+        .enumerate()
+        .any(|(other, member)| other != place && member.reported().as_ref() == Some(&outpoint));
+    if someone_elses {
         return Err(refuse(CantDoReason::InvalidParameters));
     }
     let recorded = sqlx::query(
@@ -715,13 +1001,16 @@ async fn ring_edge_verified_action(
     let all = members_of(pool, id).await?.iter().all(|m| m.edge_verified);
     if all {
         close(pool, id, SUCCESS).await?;
+        // Every channel is there: every bond goes back.
+        release_bonds_now(pool, id).await;
         sync_order_event(ctx, id).await;
     }
     Ok(())
 }
 
 /// Ends a ring that has a roster as `to` (`success` or `partial`) and tells every member which
-/// channels were confirmed. Does nothing if the ring was already over.
+/// channels were confirmed and whose bond was taken. Does nothing if the ring was already over.
+/// The bonds themselves are decided before this is called ([`judge`]); this only reports them.
 async fn close(pool: &SqlitePool, id: Uuid, to: &str) -> Result<bool, MostroError> {
     if !advance(pool, id, &[OPEN, COMMITTING], to).await? {
         return Ok(false);
@@ -736,9 +1025,21 @@ async fn close(pool: &SqlitePool, id: Uuid, to: &str) -> Result<bool, MostroErro
         .filter(|(_, m)| m.edge_verified)
         .map(|(position, _)| position as u8)
         .collect();
+    let bonds = liquidity_bond::of_order(pool, RING, id).await?;
+    let slashed = members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| {
+            bonds
+                .iter()
+                .any(|bond| bond.payer_identity == member.identity && bond.was_taken())
+        })
+        .map(|(position, _)| position as u8)
+        .collect();
     let closed = RingClosed {
         ring_id: row.ring()?.id(),
         verified,
+        slashed,
     };
     for member in &members {
         let payload = RingPayload::Closed(closed.clone());
@@ -827,7 +1128,7 @@ pub async fn ring_cancel_action(
 fn public_status(status: &str) -> Option<RingOrderStatus> {
     Some(match status {
         PENDING => RingOrderStatus::Pending,
-        COMMITTING | OPEN => RingOrderStatus::InProgress,
+        COMMITTING | BONDING | OPEN => RingOrderStatus::InProgress,
         SUCCESS => RingOrderStatus::Success,
         PARTIAL => RingOrderStatus::Partial,
         CANCELED => RingOrderStatus::Canceled,
@@ -968,7 +1269,8 @@ async fn ids(
 /// 1. rings whose slots did not fill before their expiry become `expired`, and the members that
 ///    had joined are told;
 /// 2. rings whose window has ended are closed as `partial`, and every member is told which
-///    channels were confirmed (the channels that were opened stand);
+///    channels were confirmed (the channels that were opened stand); a ring with bonds is left
+///    to [`bond_pass`], which decides its bonds first;
 /// 3. order events that are behind are brought up to date, stopping at the first failure.
 async fn housekeeping_pass_with<F, Fut>(
     pool: &SqlitePool,
@@ -1003,7 +1305,9 @@ where
     )
     .await?;
     for id in overdue {
-        close(pool, id, PARTIAL).await?;
+        if liquidity_bond::of_order(pool, RING, id).await?.is_empty() {
+            close(pool, id, PARTIAL).await?;
+        }
     }
 
     let rows = sqlx::query(
@@ -1028,6 +1332,93 @@ where
     Ok(())
 }
 
+/// The part of housekeeping that needs this instance's node, at `now`:
+///
+/// 1. rings collecting bonds are brought forward ([`bonding_step`]);
+/// 2. rings with bonds whose window has ended have each bond decided ([`judge`]) and are then
+///    closed; if the node cannot be asked, the ring stays open until it can;
+/// 3. a bond still held on a ring that is over is let go (a safety net: it errs towards the
+///    member that paid);
+/// 4. node calls still owed and payouts are moved on (`liquidity_bond::housekeeping`).
+async fn bond_pass(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    now: u64,
+) -> Result<(), MostroError> {
+    // `created_at <= now` is always true; it is there for the helper's last bind.
+    let bonding = ids(
+        pool,
+        "SELECT id FROM ring_offers WHERE status = ? AND created_at <= ?",
+        &[BONDING],
+        now as i64,
+    )
+    .await?;
+    for id in bonding {
+        bonding_step(pool, node, id, now).await?;
+    }
+
+    let overdue = ids(
+        pool,
+        "SELECT id FROM ring_offers WHERE status = ? AND window_ends_at <= ?",
+        &[OPEN],
+        now as i64,
+    )
+    .await?;
+    for id in overdue {
+        if liquidity_bond::of_order(pool, RING, id).await?.is_empty() {
+            continue;
+        }
+        judge(pool, node, id, now).await?;
+        close(pool, id, PARTIAL).await?;
+    }
+
+    let rows = sqlx::query(
+        "SELECT b.id AS id FROM liquidity_bonds b JOIN ring_offers r ON r.id = b.order_id \
+         WHERE b.kind = 'ring' AND b.state IN ('requested', 'locked') \
+         AND r.status IN ('success', 'partial', 'canceled', 'expired')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    for row in rows {
+        let bond: String = row.try_get("id").map_err(db_err)?;
+        if let Ok(bond) = Uuid::parse_str(&bond) {
+            liquidity_bond::release(pool, node, bond).await?;
+        }
+    }
+
+    liquidity_bond::housekeeping(pool, node, now).await
+}
+
+/// True when [`bond_pass`] has something to do, so an instance without bonds never connects to
+/// its node for them.
+async fn bond_work(pool: &SqlitePool) -> Result<bool, MostroError> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM ring_offers WHERE status = ?")
+        .bind(BONDING)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    let bonding: i64 = row.try_get("n").map_err(db_err)?;
+    Ok(bonding > 0 || liquidity_bond::any_open(pool).await?)
+}
+
+/// One pass over the bonds now, on this instance's node. Called by the scheduler, more often
+/// than the full housekeeping pass: a ring opens as soon as its last bond is seen locked.
+pub async fn bond_pass_now(ctx: &AppContext) {
+    let pool = ctx.pool();
+    let pass = async {
+        liquidity_bond::forfeit_unclaimed(pool, now()).await?;
+        if !bond_work(pool).await? {
+            return Ok(());
+        }
+        let node = liquidity_bond::node().await?;
+        bond_pass(pool, &*node, now()).await
+    };
+    if let Err::<(), MostroError>(e) = pass.await {
+        tracing::warn!("ring bonds: pass ended early ({e}); the next one continues");
+    }
+}
+
 /// One housekeeping pass now, on this instance's relays. Called by the scheduler.
 pub async fn housekeeping_pass(ctx: &AppContext) {
     let client = ctx.nostr_client();
@@ -1044,6 +1435,9 @@ pub async fn housekeeping_pass(ctx: &AppContext) {
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::app::liquidity_bond::testing::{self, MockNode};
+    use bipnip_ln::HoldState;
+    use mostro_core::bond::{payout_sat, routing_reserve_sat};
     use mostro_core::node_binding::{
         sign_ln_message, Action as BindingAction, Network, SignedStatement, Statement,
     };
@@ -1057,6 +1451,8 @@ mod tests {
         identity: Keys,
         trade: Keys,
         node: SecretKey,
+        /// The bond this party asks for in a ring it creates.
+        bond_sat: u64,
     }
 
     impl Party {
@@ -1067,6 +1463,15 @@ mod tests {
                 identity: Keys::generate(),
                 trade: Keys::generate(),
                 node,
+                bond_sat: 0,
+            }
+        }
+
+        /// A party whose rings ask every member for a bond.
+        fn bonded() -> Self {
+            Party {
+                bond_sat: BOND,
+                ..Party::new()
             }
         }
 
@@ -1110,6 +1515,7 @@ mod tests {
                 slots,
                 announce: true,
                 open_window_secs: 48 * 3_600,
+                bond_sat: self.bond_sat,
                 expires_at: now() + 86_400,
                 seat: self.seat(),
             }
@@ -1467,6 +1873,7 @@ mod tests {
             identity: Keys::generate(),
             trade: Keys::generate(),
             node: creator.node,
+            bond_sat: 0,
         };
         assert_eq!(
             refused(same_node.take(&ctx, id).await),
@@ -1799,6 +2206,7 @@ mod tests {
         let closed = RingPayload::Closed(RingClosed {
             ring_id: ring.id(),
             verified: vec![0, 1],
+            slashed: vec![],
         });
         let open = RingPayload::Open(RingOpen {
             ring_id: ring.id(),
@@ -1831,5 +2239,497 @@ mod tests {
         commit(&ctx, id, &parties[0], &ring).await.unwrap();
         commit(&ctx, id, &parties[1], &ring).await.unwrap();
         assert_eq!(status(&ctx, id).await, OPEN);
+    }
+
+    // ---- bonds -------------------------------------------------------------------------------
+
+    /// What every member of a bonded test ring locks.
+    const BOND: u64 = 50_000;
+
+    /// The outpoint [`edge`] reports for `n`.
+    fn outpoint(n: u8) -> String {
+        format!("{}:{n}", format!("{n:02x}").repeat(32))
+    }
+
+    fn node_of(party: &Party) -> String {
+        party.node_key().to_string()
+    }
+
+    /// The payment hash of the one bond invoice a party was sent. The simulated node's invoices
+    /// are `lnbcrt1` followed by the hash.
+    async fn bond_hash(party: &Party) -> String {
+        let invoices = party.got(Action::RingBondInvoice).await;
+        assert_eq!(invoices.len(), 1, "one bond invoice");
+        let RingPayload::Invoice(invoice) = &invoices[0] else {
+            panic!("not an invoice");
+        };
+        invoice.validate().unwrap();
+        invoice
+            .invoice
+            .strip_prefix("lnbcrt1")
+            .expect("a simulated invoice")
+            .to_string()
+    }
+
+    /// One pass over the bonds at `at`, on the simulated node every test shares.
+    async fn bonds_pass(ctx: &AppContext, at: u64) {
+        bond_pass(ctx.pool(), &*testing::shared(), at)
+            .await
+            .unwrap();
+    }
+
+    /// A full ring with every commit in, waiting for its bonds. Returns the bond hashes in the
+    /// order of `parties`.
+    async fn bonding(ctx: &AppContext, parties: &[Party]) -> (Uuid, Ring, Vec<String>) {
+        let (id, ring) = filled(ctx, parties).await;
+        assert_eq!(ring.terms.bond_sat, BOND);
+        for party in parties {
+            commit(ctx, id, party, &ring).await.unwrap();
+        }
+        assert_eq!(status(ctx, id).await, BONDING);
+        let mut hashes = Vec::new();
+        for party in parties {
+            hashes.push(bond_hash(party).await);
+        }
+        (id, ring, hashes)
+    }
+
+    /// A ring with bonds, every bond paid and seen: open.
+    async fn bonded(ctx: &AppContext, parties: &[Party]) -> (Uuid, Ring, Vec<String>) {
+        let (id, ring, hashes) = bonding(ctx, parties).await;
+        for hash in &hashes {
+            testing::shared().pay(hash);
+        }
+        bonds_pass(ctx, now()).await;
+        assert_eq!(status(ctx, id).await, OPEN);
+        (id, ring, hashes)
+    }
+
+    /// The states of a ring's bonds, in roster order.
+    async fn bond_states(
+        ctx: &AppContext,
+        id: Uuid,
+        parties: &[Party],
+        ring: &Ring,
+    ) -> Vec<String> {
+        let bonds = liquidity_bond::of_order(ctx.pool(), RING, id)
+            .await
+            .unwrap();
+        (0..ring.members.len())
+            .map(|position| {
+                let who = at(parties, ring, position).identity.public_key().to_hex();
+                let bond = bonds
+                    .iter()
+                    .find(|bond| bond.payer_identity == who)
+                    .expect("a bond");
+                bond.state.clone()
+            })
+            .collect()
+    }
+
+    /// The closing report a party was sent.
+    async fn closed_of(party: &Party) -> RingClosed {
+        let closed = party.got(Action::RingClosed).await;
+        assert_eq!(closed.len(), 1, "one closing report");
+        match &closed[0] {
+            RingPayload::Closed(closed) => closed.clone(),
+            _ => panic!("not a closing report"),
+        }
+    }
+
+    fn claim_with(ring_id: String, invoice: &str) -> Option<RingPayload> {
+        Some(RingPayload::Invoice(RingInvoice {
+            ring_id,
+            invoice: invoice.to_string(),
+        }))
+    }
+
+    async fn report(ctx: &AppContext, id: Uuid, who: &Party, action: Action, what: RingPayload) {
+        who.send(ctx, Some(id), action, Some(what)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ring_with_bonds_opens_only_when_every_bond_is_locked_and_gives_them_all_back() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let parties = [Party::bonded(), Party::new(), Party::new()];
+        let (id, ring, hashes) = bonding(&ctx, &parties).await;
+        for (party, hash) in parties.iter().zip(&hashes) {
+            assert_eq!(node.hold(hash), Some(HoldState::Open));
+            assert_eq!(party.count(Action::RingOpen).await, 0);
+        }
+
+        // Two of three bonds paid: nobody is told to open, and nobody is sent a second invoice.
+        node.pay(&hashes[0]);
+        node.pay(&hashes[1]);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, BONDING);
+        for party in &parties {
+            assert_eq!(party.count(Action::RingBondInvoice).await, 1);
+            assert_eq!(party.count(Action::RingOpen).await, 0);
+        }
+        // A channel report is not taken yet.
+        let early = at(&parties, &ring, 0)
+            .send(&ctx, Some(id), Action::RingEdgeOpened, Some(edge(&ring, 1)))
+            .await;
+        assert_eq!(refused(early), CantDoReason::NotAllowedByStatus);
+
+        node.pay(&hashes[2]);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, OPEN);
+        bonds_pass(&ctx, now()).await;
+        for party in &parties {
+            assert_eq!(party.count(Action::RingOpen).await, 1);
+        }
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::LOCKED; 3]
+        );
+
+        // Every member opens and every channel is confirmed: every bond goes back.
+        for n in 0..3u8 {
+            let (opener, receiver) = (
+                at(&parties, &ring, usize::from(n)),
+                at(&parties, &ring, usize::from(n) + 1),
+            );
+            let what = edge(&ring, n + 1);
+            report(&ctx, id, opener, Action::RingEdgeOpened, what.clone()).await;
+            report(&ctx, id, receiver, Action::RingEdgeVerified, what).await;
+        }
+        assert_eq!(status(&ctx, id).await, SUCCESS);
+        for hash in &hashes {
+            assert_eq!(node.hold(hash), Some(HoldState::Canceled));
+        }
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::RELEASED; 3]
+        );
+        for party in &parties {
+            let closed = closed_of(party).await;
+            closed.check(&ring).unwrap();
+            assert!(closed.is_complete(&ring));
+            assert!(closed.slashed.is_empty());
+        }
+        // Nothing was taken, so nothing can be claimed.
+        let (invoice, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let claim = at(&parties, &ring, 0)
+            .send(
+                &ctx,
+                Some(id),
+                Action::RingBondClaim,
+                claim_with(ring.id(), &invoice),
+            )
+            .await;
+        assert_eq!(refused(claim), CantDoReason::NotAllowedByStatus);
+        bonds_pass(&ctx, now()).await;
+        assert!(!node.sent().iter().any(|(sent, _)| sent == &invoice));
+    }
+
+    #[tokio::test]
+    async fn a_bond_that_is_not_paid_in_time_cancels_the_ring_and_frees_the_others() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let parties = [Party::bonded(), Party::new(), Party::new()];
+        let (id, ring, hashes) = bonding(&ctx, &parties).await;
+        node.pay(&hashes[0]);
+        node.pay(&hashes[1]);
+        bonds_pass(&ctx, now() + BOND_PAY_WINDOW_SECS - 30).await;
+        assert_eq!(status(&ctx, id).await, BONDING);
+        bonds_pass(&ctx, now() + BOND_PAY_WINDOW_SECS + 1).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        for (party, hash) in parties.iter().zip(&hashes) {
+            assert_eq!(node.hold(hash), Some(HoldState::Canceled));
+            assert_eq!(party.count(Action::Canceled).await, 1);
+            assert_eq!(party.count(Action::RingOpen).await, 0);
+        }
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::RELEASED; 3]
+        );
+        // The third member pays too late: the invoice is gone.
+        bonds_pass(&ctx, now() + BOND_PAY_WINDOW_SECS + 60).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+
+        // Bonds that are all locked, but seen only after the window: nobody is told to open a
+        // ring that is already over. It is canceled and every bond goes back.
+        let parties = [Party::bonded(), Party::new()];
+        let (id, ring, hashes) = bonding(&ctx, &parties).await;
+        node.pay(&hashes[0]);
+        node.pay(&hashes[1]);
+        bonds_pass(&ctx, ring.window_ends_at()).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        for (party, hash) in parties.iter().zip(&hashes) {
+            assert_eq!(node.hold(hash), Some(HoldState::Canceled));
+            assert_eq!(party.count(Action::RingOpen).await, 0);
+        }
+
+        // The node letting one locked payment go ends the ring the same way.
+        let parties = [Party::bonded(), Party::new()];
+        let (id, ring, hashes) = bonding(&ctx, &parties).await;
+        node.pay(&hashes[0]);
+        node.pay(&hashes[1]);
+        node.time_out(&hashes[1]);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        assert_eq!(node.hold(&hashes[0]), Some(HoldState::Canceled));
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::RELEASED; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn when_the_window_ends_a_missing_channel_costs_its_opener_the_bond() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let parties = [Party::bonded(), Party::new(), Party::new()];
+        let (id, ring, _) = bonded(&ctx, &parties).await;
+        let (m0, m1, m2) = (
+            at(&parties, &ring, 0),
+            at(&parties, &ring, 1),
+            at(&parties, &ring, 2),
+        );
+        let hash = |party: &Party| {
+            let who = party.identity.public_key().to_hex();
+            let pool = ctx.pool().clone();
+            async move {
+                let bonds = liquidity_bond::of_order(&pool, RING, id).await.unwrap();
+                let bond = bonds.iter().find(|bond| bond.payer_identity == who);
+                bond.expect("a bond").payment_hash.clone()
+            }
+        };
+        let (h0, h1, h2) = (hash(m0).await, hash(m1).await, hash(m2).await);
+
+        // m0 opens to m1, who confirms. m1 opens to m2, who stays silent, but the graph shows
+        // the channel. m2 never opens.
+        report(&ctx, id, m0, Action::RingEdgeOpened, edge(&ring, 1)).await;
+        report(&ctx, id, m1, Action::RingEdgeVerified, edge(&ring, 1)).await;
+        report(&ctx, id, m1, Action::RingEdgeOpened, edge(&ring, 2)).await;
+        node.announce(&node_of(m1), &node_of(m2), 2_000_000, &outpoint(2));
+
+        // Before the window ends nothing is decided, by either pass.
+        let end = ring.window_ends_at();
+        bonds_pass(&ctx, end - 1).await;
+        assert_eq!(status(&ctx, id).await, OPEN);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::LOCKED; 3]
+        );
+        // The pass that has no node leaves a ring with bonds alone, even overdue.
+        pass_at(&ctx, end).await;
+        assert_eq!(status(&ctx, id).await, OPEN);
+
+        // A node that cannot be asked: the bond that needs no graph (its channel was confirmed)
+        // goes back; the two that need the graph stay locked and the ring stays open.
+        let blind = MockNode::new();
+        blind.set_down(true);
+        assert!(bond_pass(ctx.pool(), &*blind, end).await.is_err());
+        assert_eq!(status(&ctx, id).await, OPEN);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![
+                liquidity_bond::RELEASED,
+                liquidity_bond::LOCKED,
+                liquidity_bond::LOCKED
+            ]
+        );
+        assert_eq!(node.hold(&h2), Some(HoldState::Accepted));
+        for party in &parties {
+            assert_eq!(party.count(Action::RingClosed).await, 0);
+        }
+
+        bonds_pass(&ctx, end).await;
+        assert_eq!(status(&ctx, id).await, PARTIAL);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![
+                liquidity_bond::RELEASED,
+                liquidity_bond::RELEASED,
+                liquidity_bond::SLASHED
+            ]
+        );
+        assert_eq!(node.hold(&h0), Some(HoldState::Canceled));
+        assert_eq!(node.hold(&h1), Some(HoldState::Canceled));
+        assert_eq!(node.hold(&h2), Some(HoldState::Settled));
+        for party in &parties {
+            let closed = closed_of(party).await;
+            closed.check(&ring).unwrap();
+            assert_eq!(closed.verified, vec![0]);
+            assert_eq!(closed.slashed, vec![2]);
+            // m2 should have opened to m0: m0 is owed, nobody else.
+            assert!(closed.owed_a_bond(&ring, 0));
+            assert!(!closed.owed_a_bond(&ring, 1) && !closed.owed_a_bond(&ring, 2));
+        }
+
+        // Only m0 can claim it, for this ring, and it is paid once.
+        let (invoice, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        for other in [m1, m2, &Party::new()] {
+            let claim = other
+                .send(
+                    &ctx,
+                    Some(id),
+                    Action::RingBondClaim,
+                    claim_with(ring.id(), &invoice),
+                )
+                .await;
+            assert_eq!(refused(claim), CantDoReason::IsNotYourOrder);
+        }
+        let elsewhere = m0
+            .send(
+                &ctx,
+                Some(id),
+                Action::RingBondClaim,
+                claim_with("ef".repeat(32), &invoice),
+            )
+            .await;
+        assert_eq!(refused(elsewhere), CantDoReason::InvalidParameters);
+        m0.send(
+            &ctx,
+            Some(id),
+            Action::RingBondClaim,
+            claim_with(ring.id(), &invoice),
+        )
+        .await
+        .unwrap();
+        bonds_pass(&ctx, now()).await;
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await[2],
+            liquidity_bond::PAID
+        );
+        let payments: Vec<_> = node
+            .sent()
+            .into_iter()
+            .filter(|(sent, _)| sent == &invoice)
+            .collect();
+        assert_eq!(payments, vec![(invoice, routing_reserve_sat(BOND) * 1_000)]);
+        let (again, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let twice = m0
+            .send(
+                &ctx,
+                Some(id),
+                Action::RingBondClaim,
+                claim_with(ring.id(), &again),
+            )
+            .await;
+        assert_eq!(refused(twice), CantDoReason::NotAllowedByStatus);
+    }
+
+    #[tokio::test]
+    async fn only_a_new_channel_of_its_own_saves_a_members_bond() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+
+        // A ring of two: one channel between the two nodes is one member's opening, not both's.
+        let parties = [Party::bonded(), Party::new()];
+        let (id, ring, _) = bonded(&ctx, &parties).await;
+        let (a, b) = (at(&parties, &ring, 0), at(&parties, &ring, 1));
+        report(&ctx, id, a, Action::RingEdgeOpened, edge(&ring, 1)).await;
+        node.announce(&node_of(a), &node_of(b), 2_000_000, &outpoint(1));
+        // b cannot pass a's channel off as its own.
+        let copied = b
+            .send(&ctx, Some(id), Action::RingEdgeOpened, Some(edge(&ring, 1)))
+            .await;
+        assert_eq!(refused(copied), CantDoReason::InvalidParameters);
+        bonds_pass(&ctx, ring.window_ends_at()).await;
+        assert_eq!(status(&ctx, id).await, PARTIAL);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::RELEASED, liquidity_bond::SLASHED]
+        );
+        let closed = closed_of(a).await;
+        assert!(closed.verified.is_empty());
+        assert_eq!(closed.slashed, vec![1]);
+        assert!(closed.owed_a_bond(&ring, 0));
+
+        // A ring of three where nobody opens a channel that counts.
+        let parties = [Party::bonded(), Party::new(), Party::new()];
+        let (id, ring, hashes) = bonding(&ctx, &parties).await;
+        let (m0, m1, m2) = (
+            at(&parties, &ring, 0),
+            at(&parties, &ring, 1),
+            at(&parties, &ring, 2),
+        );
+        // m1 and m2 already have a channel of the ring's capacity when the bonds lock.
+        node.announce(&node_of(m1), &node_of(m2), 2_000_000, "0ld:0");
+        for hash in &hashes {
+            node.pay(hash);
+        }
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, OPEN);
+        // m0 opens a channel to m1 of the wrong size.
+        node.announce(&node_of(m0), &node_of(m1), 1_999_999, "5ma11:0");
+        // m2 reports one channel; the graph shows another.
+        report(&ctx, id, m2, Action::RingEdgeOpened, edge(&ring, 3)).await;
+        node.announce(&node_of(m2), &node_of(m0), 2_000_000, "0ther:1");
+        bonds_pass(&ctx, ring.window_ends_at()).await;
+        assert_eq!(status(&ctx, id).await, PARTIAL);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::SLASHED; 3]
+        );
+        let closed = closed_of(m0).await;
+        closed.check(&ring).unwrap();
+        assert!(closed.verified.is_empty());
+        assert_eq!(closed.slashed, vec![0, 1, 2]);
+        // Each bond is owed to the member its payer should have opened to.
+        let bonds = liquidity_bond::of_order(ctx.pool(), RING, id)
+            .await
+            .unwrap();
+        for (payer, owed) in [(m0, m1), (m1, m2), (m2, m0)] {
+            let bond = bonds
+                .iter()
+                .find(|bond| bond.payer_identity == payer.identity.public_key().to_hex())
+                .unwrap();
+            assert_eq!(
+                bond.recipient_identity,
+                Some(owed.identity.public_key().to_hex())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bond_above_the_instances_limit_and_the_instances_own_bond_messages_are_refused() {
+        let ctx = ctx().await;
+        // The instance's limit is a million satoshi; the terms themselves allow this bond.
+        let mut greedy = Party::bonded();
+        greedy.bond_sat = 1_500_000;
+        let offer = greedy.offer(3);
+        offer.validate().unwrap();
+        let result = greedy
+            .send(
+                &ctx,
+                None,
+                Action::RingOffer,
+                Some(RingPayload::Offer(offer)),
+            )
+            .await;
+        assert_eq!(refused(result), CantDoReason::OutOfRangeSatsAmount);
+
+        // A member cannot send a bond invoice, and a ring without bonds owes nobody one.
+        let parties = [Party::new(), Party::new()];
+        let (id, ring) = opened(&ctx, &parties).await;
+        let (invoice, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let forged = parties[0]
+            .send(
+                &ctx,
+                Some(id),
+                Action::RingBondInvoice,
+                claim_with(ring.id(), &invoice),
+            )
+            .await;
+        assert_eq!(refused(forged), CantDoReason::InvalidAction);
+        pass_at(&ctx, ring.window_ends_at()).await;
+        assert_eq!(status(&ctx, id).await, PARTIAL);
+        let claim = parties[0]
+            .send(
+                &ctx,
+                Some(id),
+                Action::RingBondClaim,
+                claim_with(ring.id(), &invoice),
+            )
+            .await;
+        assert_eq!(refused(claim), CantDoReason::IsNotYourOrder);
+        assert!(closed_of(&parties[0]).await.slashed.is_empty());
     }
 }
