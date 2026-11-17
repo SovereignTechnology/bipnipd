@@ -70,13 +70,16 @@ pub async fn start_scheduler(ctx: AppContext) {
 }
 
 /// bipnip: once a minute, expire lease offers nobody took, cancel leases that
-/// stalled during setup, and bring public lease order events up to date
-/// (`app::lease::housekeeping_pass`). It touches no escrow and no node.
+/// stalled during setup, expire rings that did not fill, close rings whose
+/// window ended, and bring the public order events up to date
+/// (`app::lease::housekeeping_pass`, `app::ring::housekeeping_pass`). It
+/// touches no escrow and no node.
 async fn job_lease_housekeeping(ctx: AppContext) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             crate::app::lease::housekeeping_pass(&ctx).await;
+            crate::app::ring::housekeeping_pass(&ctx).await;
         }
     });
 }
