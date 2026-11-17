@@ -28,6 +28,7 @@ pub mod rate_user; // User reputation system
 pub mod release; // Release of held funds
 pub mod reputation; // Reputation portability: import and export of attestations
 pub mod restore_session; // Restore session action
+pub mod ring; // bipnip: liquidity ring coordination (no money moves through here)
 pub mod serbero; // Serbero, the dispute assistant: boot registration as a read-only solver
 pub mod take_buy; // Taking buy orders
 pub mod take_sell; // Taking sell orders
@@ -298,6 +299,19 @@ async fn handle_message_action_no_ln(
         | Action::LeaseCompletionInvoice => lease::lease_action(ctx, action, msg, event)
             .await
             .map_err(|e| e.into()),
+        // bipnip: liquidity rings. The instance fills the slots, fixes the
+        // roster and relays; `ring-roster`, `ring-open` and `ring-closed`
+        // are its own to send and are refused when received.
+        Action::RingOffer
+        | Action::TakeRingSlot
+        | Action::RingRoster
+        | Action::RingCommit
+        | Action::RingOpen
+        | Action::RingEdgeOpened
+        | Action::RingEdgeVerified
+        | Action::RingClosed => ring::ring_action(ctx, action, msg, event)
+            .await
+            .map_err(|e| e.into()),
         _ => {
             tracing::info!("Received message with action {:?}", action);
             Ok(())
@@ -319,6 +333,12 @@ async fn handle_message_action(
     // cancel path; a lease has no escrow here to cancel.
     if matches!(action, Action::Cancel) && lease::names_a_lease(ctx, &msg).await {
         return lease::lease_cancel_action(ctx, msg, event)
+            .await
+            .map_err(|e| e.into());
+    }
+    // bipnip: the same for a cancel that names a ring.
+    if matches!(action, Action::Cancel) && ring::names_a_ring(ctx, &msg).await {
+        return ring::ring_cancel_action(ctx, msg, event)
             .await
             .map_err(|e| e.into());
     }
