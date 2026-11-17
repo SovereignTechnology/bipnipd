@@ -444,6 +444,10 @@ lnd_resynced_clear_after = 300
 # reported a channel, and paid on to the seller when the seller's channel is in
 # this node's graph and the lease still never became active.
 #
+# For now bonds run only on regtest, testnet, testnet4 and signet: with
+# bonds = true on any other chain (mainnet included), or in Cashu mode, the
+# daemon refuses to start.
+#
 # [liquidity]
 # bonds = false
 # # Largest bond a ring may ask of each member, or a lease of its buyer, in

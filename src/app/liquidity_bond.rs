@@ -162,6 +162,31 @@ pub fn allowed(settings: &LiquiditySettings, bond_sat: u64) -> bool {
     bond_sat == 0 || (settings.bonds && bond_sat <= settings.max_bond_sat)
 }
 
+/// Chains on which this instance may take bonds while the bond code awaits its owner's read.
+const BOND_TEST_NETWORKS: [&str; 4] = ["regtest", "testnet", "testnet4", "signet"];
+
+/// Why this instance must not start, if `settings` turn bonds on and the node is on a chain
+/// outside [`BOND_TEST_NETWORKS`]. `networks` are the node's chains (LND `GetInfo`); none
+/// known (Cashu mode, no node asked) fails closed. Bonds put members' payments on this
+/// instance's node, so until the bond code is read they stay on test chains.
+pub fn bonds_startup_refusal(settings: &LiquiditySettings, networks: &[String]) -> Option<String> {
+    if !settings.bonds {
+        return None;
+    }
+    match networks.first() {
+        Some(network) if BOND_TEST_NETWORKS.contains(&network.as_str()) => None,
+        Some(network) => Some(format!(
+            "[liquidity].bonds = true is refused on {network}: bonds run only on regtest, \
+             testnet, testnet4 or signet until the bond code has been read. Set bonds = false."
+        )),
+        None => Some(
+            "[liquidity].bonds = true is refused: the node's chain is not known, and bonds run \
+             only on regtest, testnet, testnet4 or signet. Set bonds = false."
+                .to_string(),
+        ),
+    }
+}
+
 #[cfg(not(test))]
 static NODE: tokio::sync::OnceCell<Arc<dyn LightningBackend>> = tokio::sync::OnceCell::const_new();
 
@@ -1756,6 +1781,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(case.bond().await.graph_before, between);
+    }
+
+    #[test]
+    fn bonds_are_refused_off_test_chains() {
+        let off = LiquiditySettings::default();
+        let on = LiquiditySettings {
+            bonds: true,
+            ..LiquiditySettings::default()
+        };
+        let chain = |name: &str| vec![name.to_string()];
+        for name in ["regtest", "testnet", "testnet4", "signet"] {
+            assert_eq!(bonds_startup_refusal(&on, &chain(name)), None, "{name}");
+        }
+        for name in ["mainnet", "bitcoin", "Mainnet", "", "simnet"] {
+            assert!(bonds_startup_refusal(&on, &chain(name)).is_some(), "{name}");
+        }
+        assert!(bonds_startup_refusal(&on, &[]).is_some());
+        // Only the first chain counts, as for dev fees.
+        assert!(bonds_startup_refusal(&on, &["mainnet".into(), "regtest".into()]).is_some());
+        // Bonds off: nothing is refused anywhere.
+        assert_eq!(bonds_startup_refusal(&off, &chain("mainnet")), None);
+        assert_eq!(bonds_startup_refusal(&off, &[]), None);
     }
 
     #[test]
