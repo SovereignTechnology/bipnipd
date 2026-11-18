@@ -20,7 +20,7 @@ use std::time::Duration;
 use mostro_core::error::CantDoReason;
 use mostro_core::node_binding::{is_bound, Network, SignedStatement};
 use mostro_core::rules::Rules;
-use nostr_sdk::prelude::{Event, JsonUtil};
+use nostr_sdk::prelude::Event;
 use secp256k1::PublicKey;
 
 use crate::app::liquidity_bond;
@@ -63,7 +63,7 @@ async fn checks(candidate: &Candidate<'_>, now: u64) -> Result<(), CantDoReason>
     if Network::from_str(&info.network).ok() != Some(candidate.network) {
         return Err(CantDoReason::InvalidParameters);
     }
-    let sent = Event::from_json(candidate.binding)
+    let sent = serde_json::from_str::<Event>(candidate.binding)
         .ok()
         .and_then(|event| SignedStatement::from_event(&event).ok())
         .ok_or(CantDoReason::NotAuthorized)?;
@@ -149,7 +149,7 @@ pub(crate) mod testing {
             .lock()
             .expect("relays")
             .iter()
-            .filter_map(|json| Event::from_json(json).ok())
+            .filter_map(|json| serde_json::from_str::<Event>(json).ok())
             .filter_map(|event| SignedStatement::from_event(&event).ok())
             .filter(|statement| statement.statement.node_pubkey == *node)
             .collect()
