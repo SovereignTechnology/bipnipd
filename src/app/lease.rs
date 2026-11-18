@@ -70,6 +70,9 @@ const INVOICED: &str = "invoiced";
 const OPENED: &str = "opened";
 const ACTIVE: &str = "active";
 const COMPLETION: &str = "completion";
+/// Most completion invoices a seller may send for one lease: the first, and fresh ones for those
+/// that expired unpaid.
+const MAX_COMPLETION_INVOICES: i64 = 8;
 const CANCELED: &str = "canceled";
 /// Nobody took the offer before its expiry. Set by the housekeeping job only.
 const EXPIRED: &str = "expired";
@@ -232,7 +235,9 @@ pub async fn lease_action(
         Action::LeaseInvoice => seller_step(ctx, msg, event, &[TAKEN], INVOICED).await,
         Action::LeaseChannelOpened => seller_step(ctx, msg, event, &[INVOICED], OPENED).await,
         Action::LeaseActive => seller_step(ctx, msg, event, &[OPENED], ACTIVE).await,
-        Action::LeaseCompletionInvoice => seller_step(ctx, msg, event, &[ACTIVE], COMPLETION).await,
+        Action::LeaseCompletionInvoice => {
+            seller_step(ctx, msg, event, &[ACTIVE, COMPLETION], COMPLETION).await
+        }
         Action::LeaseBondClaim => lease_bond_claim_action(ctx, msg, event).await,
         // The preimage goes from the buyer to the seller only. An instance that accepted it
         // could settle-and-not-relay or leak it; refusing it here keeps a misdirected client
@@ -797,6 +802,11 @@ async fn lease_bond_claim_action(
 /// payload names this offer's lease, and the offer is in the state the step follows. The message
 /// is then relayed to the buyer unchanged. The instance does not vouch for an invoice or a
 /// channel it relays: the buyer's own agent and node check both.
+///
+/// A completion invoice may come again: once the one before has expired unpaid, a fresh one is
+/// relayed, up to [`MAX_COMPLETION_INVOICES`]. One that has not expired yet, or is already
+/// expired itself, is refused. The buyer's agent pays one completion invoice per lease whatever
+/// it is sent; this limit only keeps the relaying in bounds.
 async fn seller_step(
     ctx: &AppContext,
     msg: Message,
@@ -818,11 +828,23 @@ async fn seller_step(
         .ok_or(refuse(CantDoReason::NotAllowedByStatus))?;
 
     let mut channel = None;
+    let mut completion_expires_at = None;
     let named = match kind.get_payload() {
         Some(Payload::Lease(LeasePayload::Invoice(invoice))) => {
             invoice
                 .validate()
                 .map_err(|_| refuse(CantDoReason::InvalidInvoice))?;
+            if to == COMPLETION {
+                let decoded = crate::lightning::invoice::decode_invoice(&invoice.invoice)
+                    .map_err(|_| refuse(CantDoReason::InvalidInvoice))?;
+                let expires_at = decoded
+                    .expires_at()
+                    .map_or(0, |at| i64::try_from(at.as_secs()).unwrap_or(i64::MAX));
+                if expires_at <= now() as i64 {
+                    return Err(refuse(CantDoReason::InvalidInvoice));
+                }
+                completion_expires_at = Some(expires_at);
+            }
             Some(&invoice.lease_id)
         }
         Some(Payload::Lease(LeasePayload::Channel(report))) => {
@@ -848,6 +870,26 @@ async fn seller_step(
         return Err(refuse(CantDoReason::NotAllowedByStatus));
     }
     let now = now() as i64;
+    if let Some(expires_at) = completion_expires_at {
+        // The first completion invoice, or a fresh one once the one before expired: counted in
+        // the same write that checks, so two at once cannot both pass.
+        let counted = sqlx::query(
+            "UPDATE leases SET completion_expires_at = ?, \
+             completion_count = completion_count + 1 \
+             WHERE offer_id = ? AND completion_count < ? \
+             AND (completion_expires_at IS NULL OR completion_expires_at <= ?)",
+        )
+        .bind(expires_at)
+        .bind(id.to_string())
+        .bind(MAX_COMPLETION_INVOICES)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if counted.rows_affected() != 1 {
+            return Err(refuse(CantDoReason::NotAllowedByStatus));
+        }
+    }
     let recorded = match channel {
         Some(report) => {
             sqlx::query(
@@ -1401,6 +1443,16 @@ mod tests {
         })
     }
 
+    /// A completion invoice for `contract`: a real one, payable for `expiry_secs` from now (the
+    /// instance reads a completion invoice's expiry).
+    fn completion(contract: &LeaseContract, expiry_secs: u64) -> LeasePayload {
+        let (bolt11, _) = crate::app::liquidity_bond::testing::invoice(1_000_000, expiry_secs);
+        LeasePayload::Invoice(LeaseInvoice {
+            lease_id: contract.id(),
+            invoice: bolt11,
+        })
+    }
+
     fn channel(contract: &LeaseContract) -> LeasePayload {
         LeasePayload::Channel(LeaseChannel {
             lease_id: contract.id(),
@@ -1444,7 +1496,7 @@ mod tests {
             (Action::LeaseActive, None, ACTIVE),
             (
                 Action::LeaseCompletionInvoice,
-                Some(invoice(&contract)),
+                Some(completion(&contract, 3_600)),
                 COMPLETION,
             ),
         ];
@@ -1481,6 +1533,105 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<String, _>("funding_txid"), "cd".repeat(32));
         assert_eq!(row.get::<i64, _>("output_index"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_completion_invoice_is_relayed_only_once_the_one_before_expired() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, contract) = taken(&ctx, &seller, &buyer).await;
+        for (action, payload) in [
+            (Action::LeaseInvoice, Some(invoice(&contract))),
+            (Action::LeaseChannelOpened, Some(channel(&contract))),
+            (Action::LeaseActive, None),
+        ] {
+            seller.send(&ctx, Some(id), action, payload).await.unwrap();
+        }
+        assert_eq!(status(&ctx, id).await, ACTIVE);
+        let relayed_before = buyer.inbox().await.len();
+        let send = |payload: LeasePayload| {
+            let (ctx, seller) = (&ctx, &seller);
+            async move {
+                seller
+                    .send(ctx, Some(id), Action::LeaseCompletionInvoice, Some(payload))
+                    .await
+            }
+        };
+        let count = || async {
+            sqlx::query("SELECT completion_count FROM leases WHERE offer_id = ?")
+                .bind(id.to_string())
+                .fetch_one(ctx.pool())
+                .await
+                .unwrap()
+                .get::<i64, _>("completion_count")
+        };
+        // Lets the last invoice the instance counted expire.
+        let expire = || async {
+            sqlx::query("UPDATE leases SET completion_expires_at = 0 WHERE offer_id = ?")
+                .bind(id.to_string())
+                .execute(ctx.pool())
+                .await
+                .unwrap();
+        };
+
+        // An invoice that is not one, or has already expired, is refused.
+        let mut fake = completion(&contract, 3_600);
+        if let LeasePayload::Invoice(invoice) = &mut fake {
+            invoice.invoice = format!("lnbcrt30u1{}", "q".repeat(200));
+        }
+        assert_eq!(refused(send(fake).await), CantDoReason::InvalidInvoice);
+        let (stale, _) = crate::app::liquidity_bond::testing::invoice(1_000_000, 0);
+        let stale = LeasePayload::Invoice(LeaseInvoice {
+            lease_id: contract.id(),
+            invoice: stale,
+        });
+        assert_eq!(refused(send(stale).await), CantDoReason::InvalidInvoice);
+        assert_eq!(status(&ctx, id).await, ACTIVE);
+
+        send(completion(&contract, 3_600)).await.unwrap();
+        assert_eq!(status(&ctx, id).await, COMPLETION);
+        assert_eq!(count().await, 1);
+        // A second while the first can still be paid: refused, not relayed.
+        assert_eq!(
+            refused(send(completion(&contract, 3_600)).await),
+            CantDoReason::NotAllowedByStatus
+        );
+        assert_eq!(buyer.inbox().await.len(), relayed_before + 1);
+        // Once it expired, a fresh one goes through, up to the limit.
+        for n in 2..=MAX_COMPLETION_INVOICES {
+            expire().await;
+            send(completion(&contract, 3_600)).await.unwrap();
+            assert_eq!(count().await, n);
+        }
+        let inbox = buyer.inbox().await;
+        assert_eq!(
+            inbox.len(),
+            relayed_before + usize::try_from(MAX_COMPLETION_INVOICES).unwrap()
+        );
+        assert!(inbox[relayed_before..]
+            .iter()
+            .all(|kind| kind.action == Action::LeaseCompletionInvoice));
+        expire().await;
+        assert_eq!(
+            refused(send(completion(&contract, 3_600)).await),
+            CantDoReason::NotAllowedByStatus
+        );
+        assert_eq!(count().await, MAX_COMPLETION_INVOICES);
+        assert_eq!(status(&ctx, id).await, COMPLETION);
+        // The buyer cannot send one.
+        assert_eq!(
+            refused(
+                buyer
+                    .send(
+                        &ctx,
+                        Some(id),
+                        Action::LeaseCompletionInvoice,
+                        Some(completion(&contract, 3_600))
+                    )
+                    .await
+            ),
+            CantDoReason::IsNotYourOrder
+        );
     }
 
     #[tokio::test]
