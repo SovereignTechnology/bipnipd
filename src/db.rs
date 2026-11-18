@@ -222,7 +222,7 @@ async fn migrate_remove_token_columns(pool: &SqlitePool) -> Result<(), MostroErr
         return Ok(());
     }
 
-    let mut tx = pool.begin().await.map_err(|e| {
+    let mut tx = crate::db::begin_write(pool).await.map_err(|e| {
         MostroInternalErr(ServiceError::DbAccessError(format!(
             "Failed to begin transaction: {}",
             e
@@ -421,6 +421,38 @@ async fn reconcile_existing_add_column_migration(
     Ok(false)
 }
 
+/// How long a connection waits for the write lock before giving up.
+const DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Opens the daemon's SQLite pool (issue #954): write-ahead logging, so
+/// readers never block the one writer; `synchronous = NORMAL`, which is
+/// durable across application crashes under WAL; and an explicit busy
+/// timeout, so a writer queues for the lock instead of failing at once.
+pub(crate) async fn open_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+    use std::str::FromStr;
+
+    let options = SqliteConnectOptions::from_str(db_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(DB_BUSY_TIMEOUT);
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+}
+
+/// Begins a transaction that will write, taking the write lock up front
+/// (`BEGIN IMMEDIATE`). A deferred transaction that reads first and writes
+/// later is refused with `database is locked` the moment another writer got
+/// in between, and the busy timeout does not apply to that refusal: that is
+/// how issue #954 dropped a buyer's `fiat-sent`. An immediate transaction
+/// queues on the lock instead.
+pub(crate) async fn begin_write(
+    pool: &SqlitePool,
+) -> Result<sqlx::Transaction<'static, Sqlite>, sqlx::Error> {
+    pool.begin_with("BEGIN IMMEDIATE").await
+}
+
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
@@ -441,7 +473,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
 
         // Create new database connection
-        match SqlitePool::connect(db_url).await {
+        match open_pool(db_url).await {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => {
@@ -492,7 +524,7 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
     } else {
         // Connect to existing database
-        let conn = SqlitePool::connect(db_url)
+        let conn = open_pool(db_url)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
@@ -711,8 +743,7 @@ pub async fn update_order_to_initial_state(
     let preimage: Option<String> = None;
     let buyer_invoice: Option<String> = None;
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let result = sqlx::query(
@@ -2078,7 +2109,7 @@ pub async fn move_reputation_binding_once(
     valid_until: i64,
 ) -> Result<bool, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     // A write first: it takes SQLite's writer lock, so racing moves run one
     // after the other.
     sqlx::query(
@@ -2135,7 +2166,7 @@ pub async fn record_reputation_issuer_key(
     seen_at: i64,
 ) -> Result<Option<String>, MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     let bound: Option<String> =
         sqlx::query_scalar("SELECT issuer FROM reputation_issuer_keys WHERE issuer_key = ?1")
             .bind(issuer_key)
@@ -7351,5 +7382,71 @@ mod migration_and_query_tests {
         assert_eq!(reverted.created_at, 1_700_000_000);
         assert_eq!(reverted.seeded_reviews, 0);
         assert_eq!(reverted.seeded_rating_sum, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod write_contention_tests {
+    //! Issue #954: concurrent read-then-write transactions on the daemon's
+    //! pool must all commit; none may be dropped with `database is locked`.
+
+    use super::{begin_write, open_pool};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_read_then_write_transactions_all_commit() {
+        // Arrange: a file-backed database, as the daemon uses.
+        let dir = std::env::temp_dir().join(format!("mostro-954-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("contention.db");
+        std::fs::File::create_new(&path).unwrap();
+        let url = format!("sqlite://{}", path.display());
+        let pool = open_pool(&url).await.unwrap();
+        sqlx::query("CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO counter (id, v) VALUES (1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Act: 8 tasks, 25 read-modify-write transactions each.
+        const TASKS: i64 = 8;
+        const ROUNDS: i64 = 25;
+        let mut handles = Vec::new();
+        for _ in 0..TASKS {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ROUNDS {
+                    let mut tx = begin_write(&pool).await?;
+                    let v: i64 = sqlx::query_scalar("SELECT v FROM counter WHERE id = 1")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    tokio::task::yield_now().await;
+                    sqlx::query("UPDATE counter SET v = ? WHERE id = 1")
+                        .bind(v + 1)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                }
+                Ok::<(), sqlx::Error>(())
+            }));
+        }
+        let mut failures = Vec::new();
+        for h in handles {
+            if let Err(e) = h.await.unwrap() {
+                failures.push(e.to_string());
+            }
+        }
+
+        // Assert: nothing was dropped and no update was lost.
+        let total: i64 = sqlx::query_scalar("SELECT v FROM counter WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "dropped transactions: {failures:?}");
+        assert_eq!(total, TASKS * ROUNDS);
     }
 }

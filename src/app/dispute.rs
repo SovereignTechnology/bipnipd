@@ -145,7 +145,7 @@ async fn persist_dispute(
     order: &Order,
 ) -> Result<(), MostroError> {
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(pool).await.map_err(db_err)?;
     sqlx::query(
         "INSERT INTO disputes (id, order_id, status, order_previous_status, solver_pubkey, \
          created_at, taken_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

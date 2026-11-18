@@ -1195,8 +1195,7 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
     // window to repair.
     let now = Utc::now().timestamp();
 
-    let mut tx = pool
-        .begin()
+    let mut tx = crate::db::begin_write(pool)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

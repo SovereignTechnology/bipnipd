@@ -149,7 +149,7 @@ async fn record_import(
     let db_err = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
     let identity_hex = event.identity.to_hex();
     let now = Timestamp::now().as_secs() as i64;
-    let mut tx = ctx.pool().begin().await.map_err(db_err)?;
+    let mut tx = crate::db::begin_write(ctx.pool()).await.map_err(db_err)?;
 
     sqlx::query(
         "INSERT OR IGNORE INTO users (pubkey, created_at, native_created_at) VALUES (?1, ?2, ?2)",

@@ -912,7 +912,7 @@ async fn count_dev_fee_failure(
     order_id: uuid::Uuid,
     payment_hash: Option<&str>,
 ) -> Result<Option<(i64, i64)>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::begin_write(pool).await?;
     let Some(failed_attempts) = sqlx::query_scalar::<_, i64>(
         "UPDATE orders
          SET dev_fee_failed_attempts = dev_fee_failed_attempts + 1,
