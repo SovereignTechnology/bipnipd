@@ -44,6 +44,7 @@
 
 use crate::app::context::AppContext;
 use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, RING};
+use crate::app::liquidity_vet::{self, Candidate};
 use crate::util::enqueue_order_msg;
 use bipnip_ln::LightningBackend;
 use mostro_core::bond::bond_cltv_delta;
@@ -307,6 +308,19 @@ async fn ring_offer_action(
     offer
         .check_binding(&creator, now)
         .map_err(|_| refuse(CantDoReason::NotAuthorized))?;
+    // The creator takes the first seat, so it meets the ring's own rules too.
+    let candidate = Candidate {
+        node: offer
+            .seat
+            .node_key()
+            .map_err(|_| refuse(CantDoReason::InvalidParameters))?,
+        network: offer.network,
+        identity: &creator,
+        binding: &offer.seat.binding,
+        rules: offer.rules,
+        must_be_in_graph: false,
+    };
+    liquidity_vet::vet(&candidate, now).await.map_err(refuse)?;
 
     let open: i64 = sqlx::query(
         "SELECT COUNT(*) AS n FROM ring_offers \
@@ -480,6 +494,19 @@ async fn take_ring_slot_action(
     let taker = event.identity.to_hex();
     seat.check_binding(row.offer.network, &taker, now)
         .map_err(|_| refuse(CantDoReason::NotAuthorized))?;
+    // The member's node meets the ring's rules in this instance's graph and has not revoked its
+    // binding.
+    let candidate = Candidate {
+        node: seat
+            .node_key()
+            .map_err(|_| refuse(CantDoReason::InvalidParameters))?,
+        network: row.offer.network,
+        identity: &taker,
+        binding: &seat.binding,
+        rules: row.offer.rules,
+        must_be_in_graph: false,
+    };
+    liquidity_vet::vet(&candidate, now).await.map_err(refuse)?;
     let seat_json = serde_json::to_string(seat)
         .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
 
@@ -1526,6 +1553,7 @@ mod tests {
                 bond_sat: self.bond_sat,
                 expires_at: now() + 86_400,
                 seat: self.seat(),
+                rules: Default::default(),
             }
         }
 
@@ -1633,6 +1661,58 @@ mod tests {
     }
 
     /// The creator's ring is stored; returns its order id.
+    #[tokio::test]
+    async fn a_ring_with_rules_takes_only_nodes_that_meet_them_here() {
+        let ctx = ctx().await;
+        let (creator, member) = (Party::new(), Party::new());
+        let rules = mostro_core::rules::Rules {
+            min_channels: 1,
+            ..Default::default()
+        };
+        let mut offer = creator.offer(2);
+        offer.rules = rules;
+        // The creator takes the first seat, so its node is held to the rules too.
+        assert_eq!(
+            refused(
+                creator
+                    .send(
+                        &ctx,
+                        None,
+                        Action::RingOffer,
+                        Some(RingPayload::Offer(offer.clone()))
+                    )
+                    .await
+            ),
+            CantDoReason::RulesNotMet
+        );
+        let graph = testing::shared();
+        graph.know(&creator.node_key().to_string(), 1, 500_000);
+        creator
+            .send(
+                &ctx,
+                None,
+                Action::RingOffer,
+                Some(RingPayload::Offer(offer)),
+            )
+            .await
+            .unwrap();
+        let id = creator.inbox().await.pop().unwrap().id.unwrap();
+        assert_eq!(
+            refused(member.take(&ctx, id).await),
+            CantDoReason::RulesNotMet
+        );
+        graph.know(&member.node_key().to_string(), 3, 3_000_000);
+        member.take(&ctx, id).await.unwrap();
+        assert_eq!(status(&ctx, id).await, COMMITTING);
+        // The roster names the rules: every member's commit covers them.
+        let rosters = member.got(Action::RingRoster).await;
+        let RingPayload::Roster(roster) = &rosters[0] else {
+            panic!("not a roster");
+        };
+        let (ring, _) = roster.check(now()).unwrap();
+        assert_eq!(ring.terms.rules, rules);
+    }
+
     async fn offered(ctx: &AppContext, creator: &Party, slots: u8) -> Uuid {
         let offer = Some(RingPayload::Offer(creator.offer(slots)));
         creator
