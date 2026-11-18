@@ -44,10 +44,12 @@
 
 use crate::app::context::AppContext;
 use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, RING};
+use crate::app::liquidity_outcome;
 use crate::app::liquidity_vet::{self, Candidate};
 use crate::util::enqueue_order_msg;
 use bipnip_ln::LightningBackend;
 use mostro_core::bond::bond_cltv_delta;
+use mostro_core::outcome::{Deal, OutcomeResult};
 use mostro_core::prelude::*;
 use mostro_core::ring::Ring;
 use mostro_core::ring_message::{
@@ -1063,8 +1065,36 @@ async fn close(pool: &SqlitePool, id: Uuid, to: &str) -> Result<bool, MostroErro
         })
         .map(|(position, _)| position as u8)
         .collect();
+    let ring = row.ring()?;
+    // This instance's account of each edge, for announced rings: opened when the receiver
+    // confirmed it or the bond came back, missing otherwise.
+    if ring.terms.announce {
+        let now = now();
+        for (place, member) in members.iter().enumerate() {
+            let next = &members[(place + 1) % members.len()];
+            let bond = bonds
+                .iter()
+                .find(|bond| bond.payer_identity == member.identity);
+            let opened = member.edge_verified || bond.is_some_and(|bond| !bond.was_taken());
+            let decided = liquidity_outcome::Decided {
+                deal: Deal::Ring,
+                subject: ring.id(),
+                network: ring.terms.network,
+                nodes: [member.node.clone(), next.node.clone()],
+                result: if opened {
+                    OutcomeResult::Opened
+                } else {
+                    OutcomeResult::Missing
+                },
+                outpoint: member.reported().filter(|_| member.edge_verified),
+            };
+            if let Err(e) = liquidity_outcome::queue(pool, &decided, now).await {
+                tracing::warn!("ring {id}: outcome not kept: {e}");
+            }
+        }
+    }
     let closed = RingClosed {
-        ring_id: row.ring()?.id(),
+        ring_id: ring.id(),
         verified,
         slashed,
     };

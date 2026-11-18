@@ -22,6 +22,7 @@ pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
 pub mod lease; // bipnip: liquidity lease coordination (no lease money held here)
 pub mod liquidity_bond; // bipnip: bonds on liquidity rings (hold invoices on this node)
+pub mod liquidity_outcome; // bipnip: outcomes this instance signs about rings and bonds
 pub mod liquidity_vet; // bipnip: checks on the nodes in liquidity orders
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
