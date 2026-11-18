@@ -372,39 +372,74 @@ pub async fn release_action(
         .get_next_trade_key()
         .map_err(MostroInternalErr)?;
 
-    // Settle seller hold invoice
-    settle_seller_hold_invoice(event, escrow, Action::Released, false, &order).await?;
+    // Claim the transition BEFORE touching Lightning (issue #904). The status
+    // pre-check above is a plain read: two concurrent `release` messages (a
+    // client retry, a relay redelivery) both pass it. Only the caller whose
+    // compare-and-swap moves the row out of `FiatSent`/`Dispute` may settle;
+    // the loser returns without settling, notifying or paying.
+    let prior_status = order.status.clone();
+    let claimed = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status IN (?, ?)")
+        .bind(Status::SettledHoldInvoice.to_string())
+        .bind(order.id)
+        .bind(Status::FiatSent.to_string())
+        .bind(Status::Dispute.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
+        .rows_affected()
+        == 1;
+    if !claimed {
+        tracing::warn!(
+            "Order {} release skipped: another release already claimed it",
+            order.id
+        );
+        return Ok(());
+    }
+
+    // Settle seller hold invoice. If it fails, nothing irreversible has
+    // happened and nothing was published, so hand the claim back: the seller
+    // can retry, instead of the order sitting in `SettledHoldInvoice` with an
+    // unsettled invoice until its CLTV expires. The give-back is itself a
+    // compare-and-swap (only our own untouched claim is undone).
+    if let Err(e) = settle_seller_hold_invoice(event, escrow, Action::Released, false, &order).await
+    {
+        let reverted = sqlx::query(
+            "UPDATE orders SET status = ? WHERE id = ? AND status = ? AND hold_settled_at IS NULL",
+        )
+        .bind(&prior_status)
+        .bind(order.id)
+        .bind(Status::SettledHoldInvoice.to_string())
+        .execute(pool)
+        .await;
+        if !matches!(&reverted, Ok(r) if r.rows_affected() == 1) {
+            tracing::error!(
+                "Order {}: hold invoice settle failed and the release claim could not be handed back",
+                order.id
+            );
+        }
+        return Err(e);
+    }
+    // The invoice is settled: record it before anything that can fail.
+    sqlx::query("UPDATE orders SET hold_settled_at = ? WHERE id = ?")
+        .bind(chrono::Utc::now().timestamp())
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
     // Update order event with status SettledHoldInvoice
     order = update_order_event(my_keys, Status::SettledHoldInvoice, &order)
         .await
         .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
 
-    // Persist the status change to DB before calling do_payment.
-    // do_payment spawns async tasks that capture an Order copy; without this
-    // explicit write the settled-hold-invoice status only lived in memory and
-    // was persisted as a side-effect of the full-row writes in
-    // check_failure_retries / payment_success (now replaced by targeted updates).
-    let result = sqlx::query(
-        "UPDATE orders SET status = ?, event_id = ?, hold_settled_at = ? \
-             WHERE id = ? AND status IN (?, ?)",
-    )
-    .bind(&order.status)
-    .bind(&order.event_id)
-    .bind(chrono::Utc::now().timestamp())
-    .bind(order.id)
-    .bind(Status::FiatSent.to_string())
-    .bind(Status::Dispute.to_string())
-    .execute(pool)
-    .await
-    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
-
-    if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order.id
-        );
-        return Ok(());
-    }
+    // Patch `event_id` only: a full-row write here could clobber a concurrent
+    // path's write made during the Nostr publish.
+    sqlx::query("UPDATE orders SET event_id = ? WHERE id = ?")
+        .bind(&order.event_id)
+        .bind(order.id)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     // If there was an active dispute on this order, close it since the seller
     // released the funds, resolving the situation. `Released`, not `Settled`:
@@ -2463,6 +2498,139 @@ mod tests {
         ));
         let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db_order.status, Status::FiatSent.to_string());
+    }
+
+    /// Counts `settle_hold_invoice` calls and yields inside it, so two
+    /// concurrent releases interleave the way a relay redelivery does.
+    struct CountingSlowEscrow {
+        settles: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl EscrowBackend for CountingSlowEscrow {
+        async fn create_hold_invoice(
+            &mut self,
+            _description: &str,
+            _amount: i64,
+        ) -> Result<(String, Vec<u8>, Vec<u8>), MostroError> {
+            Ok(("lnbc1".to_string(), vec![0u8; 32], vec![1u8; 32]))
+        }
+
+        async fn settle_hold_invoice(&mut self, _preimage: &str) -> Result<(), MostroError> {
+            self.settles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        }
+
+        async fn cancel_hold_invoice(&mut self, _hash: &str) -> Result<(), MostroError> {
+            Ok(())
+        }
+    }
+
+    /// Issue #904: two concurrent `release` messages for one order must settle
+    /// the hold invoice exactly once, and only the winner notifies the buyer.
+    #[tokio::test]
+    async fn release_action_concurrent_releases_settle_once() {
+        // Arrange
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let my_keys = Keys::generate();
+        let settles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut escrow_a = CountingSlowEscrow {
+            settles: settles.clone(),
+        };
+        let mut escrow_b = CountingSlowEscrow {
+            settles: settles.clone(),
+        };
+
+        // Act: both calls load the order in `FiatSent` before either writes.
+        let (a, b) = tokio::join!(
+            release_action(
+                &ctx,
+                release_message(order.id, None),
+                &event,
+                &my_keys,
+                &mut escrow_a
+            ),
+            release_action(
+                &ctx,
+                release_message(order.id, None),
+                &event,
+                &my_keys,
+                &mut escrow_b
+            ),
+        );
+
+        // Assert: one settle, both callers Ok, one `Released` to the buyer.
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(settles.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let released = queued_actions_for(order.id)
+            .await
+            .into_iter()
+            .filter(|a| *a == Action::Released)
+            .count();
+        assert_eq!(released, 1);
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
+        let settled_at: Option<i64> =
+            sqlx::query_scalar("SELECT hold_settled_at FROM orders WHERE id = ?")
+                .bind(order.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(settled_at.is_some());
+    }
+
+    /// A failed settle hands the claim back, so the seller can release again.
+    #[tokio::test]
+    async fn release_action_can_be_retried_after_a_failed_settle() {
+        // Arrange
+        init_global_config();
+        let pool = create_test_pool().await;
+        let ctx = build_ctx(&pool);
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        let order = fiat_sent_sell_order(seller, buyer)
+            .create(&pool)
+            .await
+            .unwrap();
+        let event = create_unwrapped_message_with_pubkey(seller);
+        let my_keys = Keys::generate();
+
+        // Act: the first release fails at the node, the second succeeds.
+        let first = release_action(
+            &ctx,
+            release_message(order.id, None),
+            &event,
+            &my_keys,
+            &mut FailingSettleEscrow,
+        )
+        .await;
+        let after_failure = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        let second = release_action(
+            &ctx,
+            release_message(order.id, None),
+            &event,
+            &my_keys,
+            &mut StubEscrow,
+        )
+        .await;
+
+        // Assert
+        assert!(first.is_err());
+        assert_eq!(after_failure.status, Status::FiatSent.to_string());
+        assert!(second.is_ok());
+        let db_order = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db_order.status, Status::SettledHoldInvoice.to_string());
     }
 
     #[tokio::test]
