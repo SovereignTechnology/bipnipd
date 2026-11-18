@@ -706,6 +706,11 @@ async fn decide_bond(
             if !window_over {
                 return Ok(());
             }
+            // The verdict reads this node's graph: not before the node says it is synced, or a
+            // channel gossip has not brought yet would look missing.
+            if matches!(node.node_info().await, Ok(info) if !info.synced) {
+                return Ok(());
+            }
             let contract = LeaseContract::parse(&lease.contract)
                 .map_err(|_| broken("a stored lease contract does not parse"))?;
             let in_graph = liquidity_bond::channels_between(

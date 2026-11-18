@@ -1421,8 +1421,16 @@ async fn bond_pass(
         now as i64,
     )
     .await?;
+    // The verdict reads this node's graph: not before the node says it is synced, or a channel
+    // gossip has not brought yet would look missing. The ring stays open until then.
+    // A node that cannot be asked at all fails the verdict below, as before.
+    let lagging = matches!(node.node_info().await, Ok(info) if !info.synced);
     for id in overdue {
         if liquidity_bond::of_order(pool, RING, id).await?.is_empty() {
+            continue;
+        }
+        if lagging {
+            tracing::info!("ring {id}: its bonds wait until this node is synced");
             continue;
         }
         judge(pool, node, id, now).await?;
@@ -2636,6 +2644,18 @@ mod tests {
         // The pass that has no node leaves a ring with bonds alone, even overdue.
         pass_at(&ctx, end).await;
         assert_eq!(status(&ctx, id).await, OPEN);
+
+        // A node that says it is not synced yet: nothing is decided, the ring stays open.
+        let lagging = MockNode::new();
+        lagging.set_unsynced(true);
+        bond_pass(ctx.pool(), &*lagging, end)
+            .await
+            .expect("a pass that waits");
+        assert_eq!(status(&ctx, id).await, OPEN);
+        assert_eq!(
+            bond_states(&ctx, id, &parties, &ring).await,
+            vec![liquidity_bond::LOCKED; 3]
+        );
 
         // A node that cannot be asked: the bond that needs no graph (its channel was confirmed)
         // goes back; the two that need the graph stay locked and the ring stays open.
