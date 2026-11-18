@@ -36,6 +36,7 @@
 
 use crate::app::context::AppContext;
 use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, LEASE};
+use crate::app::liquidity_vet::{self, Candidate};
 use crate::util::enqueue_order_msg;
 use bipnip_ln::LightningBackend;
 use mostro_core::bond::bond_cltv_delta;
@@ -282,6 +283,18 @@ async fn lease_offer_action(
     offer
         .check_binding(&seller, now)
         .map_err(|_| refuse(CantDoReason::NotAuthorized))?;
+    // The seller's node, as this instance's own node and the relays see it.
+    let candidate = Candidate {
+        node: offer
+            .seller_node_key()
+            .map_err(|_| refuse(CantDoReason::InvalidParameters))?,
+        network: offer.network,
+        identity: &seller,
+        binding: &offer.binding,
+        rules: Default::default(),
+        must_be_in_graph: liquidity_bond::settings().require_seller_in_graph,
+    };
+    liquidity_vet::vet(&candidate, now).await.map_err(refuse)?;
 
     let open: i64 = sqlx::query(
         "SELECT COUNT(*) AS n FROM lease_offers \
@@ -377,6 +390,17 @@ async fn take_lease_action(
     }
     take.check_binding(&contract, &buyer, now)
         .map_err(|_| refuse(CantDoReason::NotAuthorized))?;
+    // The buyer's node meets the offer's rules in this instance's graph and has not revoked
+    // its binding.
+    let candidate = Candidate {
+        node: contract.buyer_node,
+        network: row.offer.network,
+        identity: &buyer,
+        binding: &take.binding,
+        rules: row.offer.rules,
+        must_be_in_graph: false,
+    };
+    liquidity_vet::vet(&candidate, now).await.map_err(refuse)?;
     let seller_trade_key = stored_key(&row.seller_trade_pubkey)?;
 
     let bonded = row.offer.bond_sat > 0;
@@ -1310,6 +1334,7 @@ mod tests {
                 announce: true,
                 expires_at: now() + 86_400,
                 bond_sat: 0,
+                rules: Default::default(),
             }
         }
 
@@ -1533,6 +1558,138 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<String, _>("funding_txid"), "cd".repeat(32));
         assert_eq!(row.get::<i64, _>("output_index"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_take_is_refused_unless_the_buyers_node_meets_the_offers_rules_here() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let mut offer = seller.offer();
+        offer.rules = mostro_core::rules::Rules {
+            min_channels: 2,
+            min_capacity_sat: 1_000_000,
+        };
+        seller
+            .send(
+                &ctx,
+                None,
+                Action::LeaseOffer,
+                Some(LeasePayload::Offer(offer.clone())),
+            )
+            .await
+            .unwrap();
+        let id = seller.inbox().await.pop().unwrap().id.unwrap();
+        let contract = buyer.contract(&offer, 2_000_000);
+        let take = || Some(LeasePayload::Take(buyer.take(&contract)));
+        // Unknown to this instance's graph, then known but too small: refused.
+        assert_eq!(
+            refused(buyer.send(&ctx, Some(id), Action::TakeLease, take()).await),
+            CantDoReason::RulesNotMet
+        );
+        let graph = crate::app::liquidity_bond::testing::shared();
+        let node = buyer.node_key().to_string();
+        graph.know(&node, 2, 999_999);
+        assert_eq!(
+            refused(buyer.send(&ctx, Some(id), Action::TakeLease, take()).await),
+            CantDoReason::RulesNotMet
+        );
+        assert_eq!(status(&ctx, id).await, PENDING);
+        graph.know(&node, 2, 1_000_000);
+        buyer
+            .send(&ctx, Some(id), Action::TakeLease, take())
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, id).await, TAKEN);
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_newest_statement_revokes_its_binding_cannot_offer() {
+        let ctx = ctx().await;
+        let seller = Party::new();
+        // The node revoked, later than the binding the seller's agent still sends.
+        let statement = Statement::new(
+            BindingAction::Revoke,
+            Network::Regtest,
+            &seller.identity.public_key().to_hex(),
+            seller.node_key(),
+            now() - 30,
+        )
+        .unwrap();
+        let node_signature = sign_ln_message(statement.text().as_bytes(), &seller.node);
+        let revocation = SignedStatement {
+            statement,
+            node_signature,
+        }
+        .to_event_builder()
+        .finalize(&Keys::generate())
+        .unwrap()
+        .as_json();
+        crate::app::liquidity_vet::testing::relay(&revocation);
+        assert_eq!(
+            refused(
+                seller
+                    .send(
+                        &ctx,
+                        None,
+                        Action::LeaseOffer,
+                        Some(LeasePayload::Offer(seller.offer()))
+                    )
+                    .await
+            ),
+            CantDoReason::BindingRevoked
+        );
+        // A node that bound again since is fine.
+        let again = seller.binding_of(&seller.identity, now() - 10);
+        let mut offer = seller.offer();
+        offer.binding = again;
+        seller
+            .send(
+                &ctx,
+                None,
+                Action::LeaseOffer,
+                Some(LeasePayload::Offer(offer)),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_seller_this_graph_does_not_know_is_refused_when_the_instance_asks_for_it() {
+        use crate::app::liquidity_vet::{vet, Candidate};
+        let seller = Party::new();
+        let identity = seller.identity.public_key().to_hex();
+        let binding = seller.binding();
+        let candidate = |must_be_in_graph: bool, network: Network| Candidate {
+            node: seller.node_key(),
+            network,
+            identity: &identity,
+            binding: &binding,
+            rules: Default::default(),
+            must_be_in_graph,
+        };
+        assert_eq!(
+            vet(&candidate(true, Network::Regtest), now()).await,
+            Err(CantDoReason::NodeNotInGraph)
+        );
+        assert_eq!(
+            vet(&candidate(false, Network::Regtest), now()).await,
+            Ok(())
+        );
+        crate::app::liquidity_bond::testing::shared().know(
+            &seller.node_key().to_string(),
+            1,
+            1_000_000,
+        );
+        assert_eq!(vet(&candidate(true, Network::Regtest), now()).await, Ok(()));
+        // An order on another network than this instance's node.
+        assert_eq!(
+            vet(&candidate(false, Network::Signet), now()).await,
+            Err(CantDoReason::InvalidParameters)
+        );
+        // A binding that is not one.
+        let mut bad = candidate(false, Network::Regtest);
+        bad.binding = "{}";
+        assert_eq!(vet(&bad, now()).await, Err(CantDoReason::NotAuthorized));
     }
 
     #[tokio::test]

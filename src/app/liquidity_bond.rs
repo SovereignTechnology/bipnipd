@@ -93,6 +93,14 @@ pub struct LiquiditySettings {
     /// longest a lease's own hold invoice lives.
     #[serde(default = "default_lease_bond_window_secs")]
     pub lease_bond_window_secs: u64,
+    /// Lists a lease offer only when this instance's graph knows the seller's node. On by
+    /// default: a seller's node is one others can see.
+    #[serde(default = "default_true")]
+    pub require_seller_in_graph: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_max_bond_sat() -> u64 {
@@ -109,6 +117,7 @@ impl Default for LiquiditySettings {
             bonds: false,
             max_bond_sat: default_max_bond_sat(),
             lease_bond_window_secs: default_lease_bond_window_secs(),
+            require_seller_in_graph: true,
         }
     }
 }
@@ -148,11 +157,13 @@ pub fn settings() -> LiquiditySettings {
     SETTINGS.get().cloned().unwrap_or_default()
 }
 
-/// In tests, bonds are on unless a test says otherwise.
+/// In tests, bonds are on unless a test says otherwise, and sellers need not be in the
+/// simulated graph (a test that checks it puts them there).
 #[cfg(test)]
 pub fn settings() -> LiquiditySettings {
     SETTINGS.get().cloned().unwrap_or(LiquiditySettings {
         bonds: true,
+        require_seller_in_graph: false,
         ..LiquiditySettings::default()
     })
 }
@@ -945,6 +956,8 @@ pub(crate) mod testing {
         /// Every payment sent: (invoice, fee limit in msat).
         sent: Vec<(String, u64)>,
         graph: HashMap<String, Vec<GraphChannel>>,
+        /// Nodes the graph knows, with their public channels and capacity, set by a test.
+        nodes: HashMap<String, (u32, u64)>,
         down: bool,
         pay_outcome: Option<PaymentState>,
     }
@@ -995,6 +1008,15 @@ pub(crate) mod testing {
 
         pub(crate) fn hold(&self, hash: &str) -> Option<HoldState> {
             self.inner.lock().expect("node").holds.get(hash).copied()
+        }
+
+        /// Puts `node` in the simulated graph with so many public channels and that capacity.
+        pub(crate) fn know(&self, node: &str, channels: u32, capacity_sat: u64) {
+            self.inner
+                .lock()
+                .expect("node")
+                .nodes
+                .insert(node.to_string(), (channels, capacity_sat));
         }
 
         pub(crate) fn set_down(&self, down: bool) {
@@ -1169,8 +1191,12 @@ pub(crate) mod testing {
             unsupported()
         }
 
-        async fn graph_node(&self, _: &str) -> Result<Option<(u32, u64)>, BackendError> {
-            unsupported()
+        async fn graph_node(&self, node: &str) -> Result<Option<(u32, u64)>, BackendError> {
+            let inner = self.inner.lock().expect("node");
+            if inner.down {
+                return Err(down());
+            }
+            Ok(inner.nodes.get(node).copied())
         }
 
         async fn graph_channels(&self, node: &str) -> Result<Vec<GraphChannel>, BackendError> {
