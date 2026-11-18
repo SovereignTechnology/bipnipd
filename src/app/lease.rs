@@ -228,6 +228,11 @@ async fn lease_offer_action(
     if offer.is_expired(now) || offer.expires_at > now.saturating_add(MAX_OFFER_LIFETIME_SECS) {
         return Err(refuse(CantDoReason::InvalidParameters));
     }
+    // This instance takes no buyer bond on a lease yet. An offer that asks for one is refused
+    // rather than published with a bond nobody would hold.
+    if offer.bond_sat > 0 {
+        return Err(refuse(CantDoReason::OutOfRangeSatsAmount));
+    }
     let seller = event.identity.to_hex();
     offer
         .check_binding(&seller, now)
@@ -848,6 +853,7 @@ mod tests {
                 min_confirmations: 3,
                 announce: true,
                 expires_at: now() + 86_400,
+                bond_sat: 0,
             }
         }
 
@@ -1801,5 +1807,24 @@ mod tests {
         assert!(!names_a_lease(&ctx, &fiat_cancel).await);
         let no_id = Message::new_order(None, None, None, Action::Cancel, None);
         assert!(!names_a_lease(&ctx, &no_id).await);
+    }
+
+    #[tokio::test]
+    async fn an_offer_that_asks_for_a_buyer_bond_is_refused_until_the_instance_takes_them() {
+        let ctx = ctx().await;
+        let seller = Party::new();
+        let mut offer = seller.offer();
+        offer.bond_sat = 50_000;
+        // The terms themselves are valid; it is this instance that takes no lease bond.
+        offer.validate().unwrap();
+        let result = seller
+            .send(
+                &ctx,
+                None,
+                Action::LeaseOffer,
+                Some(LeasePayload::Offer(offer)),
+            )
+            .await;
+        assert_eq!(refused(result), CantDoReason::OutOfRangeSatsAmount);
     }
 }

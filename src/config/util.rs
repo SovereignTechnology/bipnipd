@@ -476,6 +476,9 @@ pub fn init_configuration_file(config_path: Option<String>) -> Result<(), Mostro
     let mut settings: Settings = toml::from_str(&contents)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;
 
+    // bipnip: the `[liquidity]` section is read by the module that uses it.
+    crate::app::liquidity_bond::load_settings(&contents)?;
+
     // Apply MOSTRO_NSEC_PRIVKEY override before validation so an empty TOML
     // value is fine when the env var is set.
     apply_nsec_env_override(&mut settings);

@@ -21,6 +21,7 @@ pub mod dispute; // User dispute handling
 pub mod fiat_sent; // Fiat payment confirmation
 pub mod last_trade_index;
 pub mod lease; // bipnip: liquidity lease coordination (no lease money held here)
+pub mod liquidity_bond; // bipnip: bonds on liquidity rings (hold invoices on this node)
 pub mod order; // Order creation and management
 pub mod orders; // Orders action
 pub mod payer; // Payer declaration + payment-account history (anti-triangulation)
@@ -296,12 +297,15 @@ async fn handle_message_action_no_ln(
         | Action::LeaseChannelOpened
         | Action::LeasePreimage
         | Action::LeaseActive
-        | Action::LeaseCompletionInvoice => lease::lease_action(ctx, action, msg, event)
+        | Action::LeaseCompletionInvoice
+        // Not taken yet: refused, like any lease action that is not a member's to send.
+        | Action::LeaseBondInvoice
+        | Action::LeaseBondClaim => lease::lease_action(ctx, action, msg, event)
             .await
             .map_err(|e| e.into()),
         // bipnip: liquidity rings. The instance fills the slots, fixes the
-        // roster and relays; `ring-roster`, `ring-open` and `ring-closed`
-        // are its own to send and are refused when received.
+        // roster and relays; `ring-roster`, `ring-open`, `ring-bond-invoice`
+        // and `ring-closed` are its own to send and are refused when received.
         Action::RingOffer
         | Action::TakeRingSlot
         | Action::RingRoster
@@ -309,7 +313,9 @@ async fn handle_message_action_no_ln(
         | Action::RingOpen
         | Action::RingEdgeOpened
         | Action::RingEdgeVerified
-        | Action::RingClosed => ring::ring_action(ctx, action, msg, event)
+        | Action::RingClosed
+        | Action::RingBondInvoice
+        | Action::RingBondClaim => ring::ring_action(ctx, action, msg, event)
             .await
             .map_err(|e| e.into()),
         _ => {

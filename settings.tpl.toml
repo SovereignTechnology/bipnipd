@@ -429,3 +429,17 @@ lnd_resynced_clear_after = 300
 # # attestation cannot carry more, and destinations cap it at 7 days by
 # # default.
 # lifetime_seconds = 604800
+
+# bipnip: bonds on liquidity rings (src/app/liquidity_bond.rs). Opt-in, disabled
+# by default. A ring may ask each member for a bond: a hold invoice on THIS
+# node, paid before anyone opens a channel and cancelled when the member's
+# channel is there. With bonds on, this node holds members' payments for up to
+# the ring's window (48 hours at most), takes the bond of a member whose
+# channel is missing from this node's own graph when the window ends, and pays
+# it on to the member that was let down. The node also publishes a binding of
+# its key to this instance's Nostr key, so members can check who they pay.
+#
+# [liquidity]
+# bonds = false
+# # Largest bond a ring on this instance may ask of each member, in satoshi.
+# max_bond_sat = 1000000
