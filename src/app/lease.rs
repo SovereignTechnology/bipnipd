@@ -2140,7 +2140,7 @@ mod tests {
             (Action::LeaseActive, None, Some(LeaseOrderStatus::Success)),
             (
                 Action::LeaseCompletionInvoice,
-                Some(invoice(&contract)),
+                Some(completion(&contract, 3_600)),
                 None,
             ),
         ];
