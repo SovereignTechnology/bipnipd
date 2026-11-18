@@ -80,6 +80,9 @@ pub async fn start_scheduler(ctx: AppContext) {
 /// instance's node, and only on an instance whose operator turned bonds on
 /// (`[liquidity]` in settings.toml). Such an instance also publishes its
 /// node binding here, once per run.
+///
+/// Once a minute it also publishes the outcomes this instance signed about
+/// the rings and lease bonds it saw end (`app::liquidity_outcome`).
 async fn job_lease_housekeeping(ctx: AppContext) {
     tokio::spawn(async move {
         let mut tick: u64 = 0;
@@ -91,6 +94,7 @@ async fn job_lease_housekeeping(ctx: AppContext) {
             if tick.is_multiple_of(6) {
                 crate::app::lease::housekeeping_pass(&ctx).await;
                 crate::app::ring::housekeeping_pass(&ctx).await;
+                crate::app::liquidity_outcome::publish_pending(&ctx).await;
             }
         }
     });

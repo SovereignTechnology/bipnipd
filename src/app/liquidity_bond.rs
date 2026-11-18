@@ -959,6 +959,8 @@ pub(crate) mod testing {
         /// Nodes the graph knows, with their public channels and capacity, set by a test.
         nodes: HashMap<String, (u32, u64)>,
         down: bool,
+        /// True when the node says it is not synced to chain and graph yet.
+        unsynced: bool,
         pay_outcome: Option<PaymentState>,
     }
 
@@ -1019,6 +1021,11 @@ pub(crate) mod testing {
                 .insert(node.to_string(), (channels, capacity_sat));
         }
 
+        /// The node says it is not synced yet (it still answers).
+        pub(crate) fn set_unsynced(&self, unsynced: bool) {
+            self.inner.lock().expect("node").unsynced = unsynced;
+        }
+
         pub(crate) fn set_down(&self, down: bool) {
             self.inner.lock().expect("node").down = down;
         }
@@ -1062,11 +1069,12 @@ pub(crate) mod testing {
     #[async_trait]
     impl LightningBackend for MockNode {
         async fn node_info(&self) -> Result<NodeInfo, BackendError> {
+            let unsynced = self.inner.lock().expect("node").unsynced;
             Ok(NodeInfo {
                 node_pubkey: self.pubkey(),
                 network: "regtest".into(),
                 block_height: 100,
-                synced: true,
+                synced: !unsynced,
             })
         }
 

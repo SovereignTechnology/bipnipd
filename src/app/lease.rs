@@ -36,6 +36,7 @@
 
 use crate::app::context::AppContext;
 use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, LEASE};
+use crate::app::liquidity_outcome;
 use crate::app::liquidity_vet::{self, Candidate};
 use crate::util::enqueue_order_msg;
 use bipnip_ln::LightningBackend;
@@ -43,6 +44,7 @@ use mostro_core::bond::bond_cltv_delta;
 use mostro_core::lease::LeaseContract;
 use mostro_core::lease_message::{LeaseInvoice, LeaseOffer, LeasePayload, LeaseTake};
 use mostro_core::lease_order::{LeaseOrder, LeaseOrderStatus};
+use mostro_core::outcome::{Deal, OutcomeResult};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::{Event, FinalizeEvent, Keys, PublicKey, Timestamp};
 use sqlx::{Row, SqliteConnection, SqlitePool};
@@ -704,6 +706,11 @@ async fn decide_bond(
             if !window_over {
                 return Ok(());
             }
+            // The verdict reads this node's graph: not before the node says it is synced, or a
+            // channel gossip has not brought yet would look missing.
+            if matches!(node.node_info().await, Ok(info) if !info.synced) {
+                return Ok(());
+            }
             let contract = LeaseContract::parse(&lease.contract)
                 .map_err(|_| broken("a stored lease contract does not parse"))?;
             let in_graph = liquidity_bond::channels_between(
@@ -727,6 +734,18 @@ async fn decide_bond(
             )
             .await?;
             if taken {
+                // This instance's account: the buyer's bond was taken.
+                let decided = liquidity_outcome::Decided {
+                    deal: Deal::Lease,
+                    subject: lease.lease_id.clone(),
+                    network: row.offer.network,
+                    nodes: [row.offer.seller_node.clone(), lease.buyer_node.clone()],
+                    result: OutcomeResult::Slashed,
+                    outpoint: None,
+                };
+                if let Err(e) = liquidity_outcome::queue(pool, &decided, now).await {
+                    tracing::warn!("lease {id}: outcome not kept: {e}");
+                }
                 // Tell the seller it is owed; it answers with an invoice.
                 let seller = stored_key(&row.seller_trade_pubkey)?;
                 enqueue_order_msg(None, Some(id), Action::LeaseBondClaim, None, seller, None).await;
