@@ -226,6 +226,8 @@ async fn main() -> Result<()> {
     // `CantDo(InvalidAction)` until the feature tracks land. The default
     // Lightning path below is left byte-for-byte unchanged.
     if Settings::is_cashu_enabled() {
+        // bipnip: no node is asked in Cashu mode, so its chain is unknown; bonds fail closed.
+        refuse_bonds_off_test_chains(&[]);
         // The `mint_urls` entries were validated at config load (CF-1); this
         // expect is unreachable for a validated config.
         let mint_urls = Settings::get_cashu()
@@ -307,6 +309,7 @@ async fn main() -> Result<()> {
         .get()
         .map(|status| status.networks.clone())
         .unwrap_or_default();
+    refuse_bonds_off_test_chains(&networks);
     if !dev_fee_payments_enabled(&networks) {
         match release_all_pending_claims(get_db_pool().as_ref()).await {
             Ok(0) => {}
@@ -582,6 +585,16 @@ fn install_price_manager() -> std::result::Result<(), Box<dyn std::error::Error>
         .map_err(|e| -> Box<dyn std::error::Error> { format!("price: {e}").into() })?;
     tracing::info!("PriceManager installed");
     Ok(())
+}
+
+/// bipnip: refuses to start when `[liquidity].bonds` is on and the node is not on a test
+/// chain (see `liquidity_bond::bonds_startup_refusal`).
+fn refuse_bonds_off_test_chains(networks: &[String]) {
+    let settings = crate::app::liquidity_bond::settings();
+    if let Some(reason) = crate::app::liquidity_bond::bonds_startup_refusal(&settings, networks) {
+        tracing::error!("REFUSING TO START: {reason}");
+        exit(1);
+    }
 }
 
 #[cfg(test)]

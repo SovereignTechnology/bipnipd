@@ -9,10 +9,20 @@
 //! One offer leads to at most one lease. Its state lives in `lease_offers.status`:
 //!
 //! ```text
-//! pending -> taken -> invoiced -> opened -> active -> completion
-//!    \________\__________\__________\-> canceled
+//! pending -> [bonding ->] taken -> invoiced -> opened -> active -> completion
+//!    \__________\___________\__________\__________\-> canceled
 //! pending -> expired
 //! ```
+//!
+//! **The buyer's bond.** The lease payment never comes here, but an offer may ask its buyer for
+//! a bond (`bond_sat`), and that does: a hold invoice on this instance's node
+//! (`app::liquidity_bond`). The take then waits in `bonding` and reaches the seller only once the
+//! bond is locked, so a seller never opens a channel for a buyer that has nothing at stake. The
+//! bond goes back when the lease becomes active, when it ends before the seller reported a
+//! channel, or when the seller cancels. It is taken, and owed to the seller, only when the bond
+//! window has ended, the lease never became active, and **this instance's own node** sees the
+//! channel the seller reported in the public graph: between the two nodes, of the contract's
+//! capacity, and not there when the bond was locked. The seller's word alone never takes it.
 //!
 //! Every step is a compare-and-swap on that column, so a repeated or out-of-order message
 //! changes nothing and relays nothing. Seller steps must come from the identity that made the
@@ -25,8 +35,12 @@
 //! cancels leases that stalled during setup.
 
 use crate::app::context::AppContext;
+use crate::app::liquidity_bond::{self, BOND_PAY_WINDOW_SECS, LEASE};
 use crate::util::enqueue_order_msg;
-use mostro_core::lease_message::{LeaseOffer, LeasePayload};
+use bipnip_ln::LightningBackend;
+use mostro_core::bond::bond_cltv_delta;
+use mostro_core::lease::LeaseContract;
+use mostro_core::lease_message::{LeaseInvoice, LeaseOffer, LeasePayload, LeaseTake};
 use mostro_core::lease_order::{LeaseOrder, LeaseOrderStatus};
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::{Event, FinalizeEvent, Keys, PublicKey, Timestamp};
@@ -49,6 +63,8 @@ const LEASE_SETUP_TIMEOUT_SECS: u64 = 48 * 3600;
 const MAX_ORDER_EVENTS_PER_PASS: i64 = 100;
 
 const PENDING: &str = "pending";
+/// Taken, in an offer that asks for a bond: the buyer's bond is awaited.
+const BONDING: &str = "bonding";
 const TAKEN: &str = "taken";
 const INVOICED: &str = "invoiced";
 const OPENED: &str = "opened";
@@ -78,6 +94,10 @@ fn stored_key(hex: &str) -> Result<PublicKey, MostroError> {
     PublicKey::parse(hex).map_err(|_| MostroInternalErr(ServiceError::InvalidPubkey))
 }
 
+fn broken(what: &str) -> MostroError {
+    MostroInternalErr(ServiceError::UnexpectedError(what.to_string()))
+}
+
 /// An offer row.
 struct Offer {
     seller_identity: String,
@@ -91,6 +111,14 @@ struct Lease {
     lease_id: String,
     buyer_identity: String,
     buyer_trade_pubkey: String,
+    buyer_node: String,
+    /// The canonical contract text.
+    contract: String,
+    /// The take as received, and the request id it came under.
+    take: Option<String>,
+    take_request_id: Option<i64>,
+    /// The channel the seller reported, as `txid:index`: a claim.
+    reported: Option<String>,
 }
 
 async fn offer_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Offer>, MostroError> {
@@ -117,7 +145,8 @@ async fn offer_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Offer>, Mostr
 
 async fn lease_by_offer(pool: &SqlitePool, id: Uuid) -> Result<Option<Lease>, MostroError> {
     let row = sqlx::query(
-        "SELECT lease_id, buyer_identity, buyer_trade_pubkey FROM leases WHERE offer_id = ?",
+        "SELECT lease_id, buyer_identity, buyer_trade_pubkey, buyer_node, contract, take, \
+         take_request_id, funding_txid, output_index FROM leases WHERE offer_id = ?",
     )
     .bind(id.to_string())
     .fetch_optional(pool)
@@ -126,10 +155,19 @@ async fn lease_by_offer(pool: &SqlitePool, id: Uuid) -> Result<Option<Lease>, Mo
     let Some(row) = row else {
         return Ok(None);
     };
+    let txid: Option<String> = row.try_get("funding_txid").map_err(db_err)?;
+    let index: Option<i64> = row.try_get("output_index").map_err(db_err)?;
     Ok(Some(Lease {
         lease_id: row.try_get("lease_id").map_err(db_err)?,
         buyer_identity: row.try_get("buyer_identity").map_err(db_err)?,
         buyer_trade_pubkey: row.try_get("buyer_trade_pubkey").map_err(db_err)?,
+        buyer_node: row.try_get("buyer_node").map_err(db_err)?,
+        contract: row.try_get("contract").map_err(db_err)?,
+        take: row.try_get("take").map_err(db_err)?,
+        take_request_id: row.try_get("take_request_id").map_err(db_err)?,
+        reported: txid
+            .zip(index)
+            .map(|(txid, index)| format!("{txid}:{index}")),
     }))
 }
 
@@ -195,9 +233,11 @@ pub async fn lease_action(
         Action::LeaseChannelOpened => seller_step(ctx, msg, event, &[INVOICED], OPENED).await,
         Action::LeaseActive => seller_step(ctx, msg, event, &[OPENED], ACTIVE).await,
         Action::LeaseCompletionInvoice => seller_step(ctx, msg, event, &[ACTIVE], COMPLETION).await,
+        Action::LeaseBondClaim => lease_bond_claim_action(ctx, msg, event).await,
         // The preimage goes from the buyer to the seller only. An instance that accepted it
         // could settle-and-not-relay or leak it; refusing it here keeps a misdirected client
-        // from finding out the hard way. The payload is dropped unread.
+        // from finding out the hard way. The payload is dropped unread. A bond invoice is the
+        // instance's own to send.
         _ => Err(refuse(CantDoReason::InvalidAction)),
     }
 }
@@ -228,9 +268,9 @@ async fn lease_offer_action(
     if offer.is_expired(now) || offer.expires_at > now.saturating_add(MAX_OFFER_LIFETIME_SECS) {
         return Err(refuse(CantDoReason::InvalidParameters));
     }
-    // This instance takes no buyer bond on a lease yet. An offer that asks for one is refused
-    // rather than published with a bond nobody would hold.
-    if offer.bond_sat > 0 {
+    // A bond is money this instance would hold: only if its operator turned bonds on, and only
+    // up to the operator's limit.
+    if !liquidity_bond::allowed(&liquidity_bond::settings(), offer.bond_sat) {
         return Err(refuse(CantDoReason::OutOfRangeSatsAmount));
     }
     let seller = event.identity.to_hex();
@@ -292,7 +332,8 @@ async fn lease_offer_action(
 /// capacity (so the buyer cannot write its own price) and freshly dated; the buyer's node binds
 /// the identity the transport proved; the buyer is not the seller. The take goes to the seller,
 /// and each side learns the other's trade key (the buyer needs the seller's to release the
-/// preimage peer to peer).
+/// preimage peer to peer). When the offer asks for a bond, the take waits here instead, and the
+/// buyer is sent a bond invoice: see [`bond_step`].
 async fn take_lease_action(
     ctx: &AppContext,
     msg: Message,
@@ -333,10 +374,15 @@ async fn take_lease_action(
         .map_err(|_| refuse(CantDoReason::NotAuthorized))?;
     let seller_trade_key = stored_key(&row.seller_trade_pubkey)?;
 
+    let bonded = row.offer.bond_sat > 0;
+    let request_id = msg.get_inner_message_kind().request_id;
+    let kept = serde_json::to_string(take)
+        .map_err(|_| MostroInternalErr(ServiceError::MessageSerializationError))?;
+
     // The state change and the lease row land together or not at all.
     let mut tx = pool.begin().await.map_err(db_err)?;
     let moved = sqlx::query("UPDATE lease_offers SET status = ? WHERE id = ? AND status = ?")
-        .bind(TAKEN)
+        .bind(if bonded { BONDING } else { TAKEN })
         .bind(id.to_string())
         .bind(PENDING)
         .execute(&mut *tx)
@@ -347,8 +393,8 @@ async fn take_lease_action(
     }
     let inserted = sqlx::query(
         "INSERT INTO leases \
-         (lease_id, offer_id, buyer_identity, buyer_trade_pubkey, buyer_node, contract, \
-          created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (lease_id, offer_id, buyer_identity, buyer_trade_pubkey, buyer_node, contract, take, \
+          take_request_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(contract.id())
     .bind(id.to_string())
@@ -356,6 +402,8 @@ async fn take_lease_action(
     .bind(event.sender.to_hex())
     .bind(contract.buyer_node.to_string())
     .bind(&take.contract)
+    .bind(kept)
+    .bind(request_id.and_then(|n| i64::try_from(n).ok()))
     .bind(now as i64)
     .bind(now as i64)
     .execute(&mut *tx)
@@ -370,6 +418,13 @@ async fn take_lease_action(
         Err(e) => return Err(db_err(e)),
     }
     tx.commit().await.map_err(db_err)?;
+
+    if bonded {
+        // The seller hears of the take only once the buyer's bond is locked.
+        bond_step_now(pool, id).await;
+        sync_order_event(ctx, id).await;
+        return Ok(());
+    }
 
     enqueue_order_msg(
         None,
@@ -390,7 +445,7 @@ async fn take_lease_action(
     )
     .await;
     enqueue_order_msg(
-        msg.get_inner_message_kind().request_id,
+        request_id,
         Some(id),
         Action::TradePubkey,
         Some(Payload::Peer(Peer::new(row.seller_trade_pubkey, None))),
@@ -400,6 +455,341 @@ async fn take_lease_action(
     .await;
     sync_order_event(ctx, id).await;
     Ok(())
+}
+
+/// Passes a take that waited for its bond on to the seller, and tells each side the other's
+/// trade key: what [`take_lease_action`] does at once for an offer without a bond.
+async fn pass_take_on(id: Uuid, row: &Offer, lease: &Lease) -> Result<(), MostroError> {
+    let take: LeaseTake = lease
+        .take
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .ok_or_else(|| broken("a lease waiting for its bond has no stored take"))?;
+    let seller = stored_key(&row.seller_trade_pubkey)?;
+    let buyer = stored_key(&lease.buyer_trade_pubkey)?;
+    enqueue_order_msg(
+        None,
+        Some(id),
+        Action::TakeLease,
+        Some(Payload::Lease(LeasePayload::Take(take))),
+        seller,
+        None,
+    )
+    .await;
+    enqueue_order_msg(
+        None,
+        Some(id),
+        Action::TradePubkey,
+        Some(Payload::Peer(Peer::new(
+            lease.buyer_trade_pubkey.clone(),
+            None,
+        ))),
+        seller,
+        None,
+    )
+    .await;
+    enqueue_order_msg(
+        lease.take_request_id.and_then(|n| u64::try_from(n).ok()),
+        Some(id),
+        Action::TradePubkey,
+        Some(Payload::Peer(Peer::new(
+            row.seller_trade_pubkey.clone(),
+            None,
+        ))),
+        buyer,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+/// One bond step now, on this instance's node. Best effort: a failure is logged and the bond
+/// pass tries again, and it never fails the take that led here.
+async fn bond_step_now(pool: &SqlitePool, id: Uuid) {
+    let step = match liquidity_bond::node().await {
+        Ok(node) => bond_step(pool, &*node, id, now()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = step {
+        tracing::warn!("lease {id}: bond not brought forward ({e}); the bond pass retries");
+    }
+}
+
+/// Brings a lease that waits for its buyer's bond forward at `now`:
+///
+/// 1. the buyer is sent a bond invoice, once;
+/// 2. the node is asked whether the bond is locked;
+/// 3. when it is, the channels the graph already shows between the two nodes are written down
+///    (they will not count as the seller's opening), the setup clock starts, and the take goes
+///    to the seller;
+/// 4. if the bond is not paid within the hour, or the node let it go, the lease is canceled
+///    and both sides are told. The seller was never asked to do anything.
+async fn bond_step(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    id: Uuid,
+    now: u64,
+) -> Result<(), MostroError> {
+    let Some(row) = offer_by_id(pool, id).await? else {
+        return Ok(());
+    };
+    if row.status != BONDING {
+        return Ok(());
+    }
+    let lease = lease_by_offer(pool, id)
+        .await?
+        .ok_or_else(|| broken("a lease waiting for its bond has no lease row"))?;
+    let contract = LeaseContract::parse(&lease.contract)
+        .map_err(|_| broken("a stored lease contract does not parse"))?;
+    let buyer = stored_key(&lease.buyer_trade_pubkey)?;
+
+    let had = liquidity_bond::of_order(pool, LEASE, id).await?;
+    let started = had
+        .first()
+        .map_or(now, |bond| u64::try_from(bond.created_at).unwrap_or(0));
+    let pay_by = started.saturating_add(BOND_PAY_WINDOW_SECS);
+    if had.is_empty() {
+        let description = format!("bipnip lease bond {}", &lease.lease_id[..16]);
+        let window = liquidity_bond::settings().lease_bond_window_secs;
+        let request = liquidity_bond::Request {
+            kind: LEASE,
+            order_id: id,
+            payer_identity: &lease.buyer_identity,
+            payer_trade_pubkey: &lease.buyer_trade_pubkey,
+            amount_sat: row.offer.bond_sat,
+            cltv_delta: bond_cltv_delta(window),
+            description: &description,
+        };
+        let invoice = liquidity_bond::request(pool, node, &request, now).await?;
+        let payload = LeasePayload::Invoice(LeaseInvoice {
+            lease_id: lease.lease_id.clone(),
+            invoice,
+        });
+        enqueue_order_msg(
+            None,
+            Some(id),
+            Action::LeaseBondInvoice,
+            Some(Payload::Lease(payload)),
+            buyer,
+            None,
+        )
+        .await;
+    }
+
+    let bonds = liquidity_bond::refresh(pool, node, LEASE, id).await?;
+    if let [bond] = bonds.as_slice() {
+        if bond.state == liquidity_bond::LOCKED {
+            let before = liquidity_bond::channels_between(
+                node,
+                &row.offer.seller_node,
+                &lease.buyer_node,
+                contract.terms.capacity_sat,
+            )
+            .await?;
+            liquidity_bond::note_graph_before(pool, bond.id, &before).await?;
+            let mut tx = pool.begin().await.map_err(db_err)?;
+            if !advance(&mut tx, id, &[BONDING], TAKEN).await? {
+                return Ok(());
+            }
+            sqlx::query("UPDATE leases SET updated_at = ? WHERE offer_id = ?")
+                .bind(now as i64)
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            return pass_take_on(id, &row, &lease).await;
+        }
+    }
+
+    let gone = bonds.iter().any(|bond| {
+        bond.state != liquidity_bond::REQUESTED && bond.state != liquidity_bond::LOCKED
+    });
+    if now >= pay_by || gone {
+        let moved = {
+            let mut conn = pool.acquire().await.map_err(db_err)?;
+            advance(&mut conn, id, &[BONDING], CANCELED).await?
+        };
+        if moved {
+            liquidity_bond::release_all(pool, node, LEASE, id).await?;
+            let seller = stored_key(&row.seller_trade_pubkey)?;
+            for party in [seller, buyer] {
+                enqueue_order_msg(None, Some(id), Action::Canceled, None, party, None).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lets a lease's bond go, now. Best effort: a bond the node could not be told about is picked
+/// up by the bond pass.
+async fn release_bond_now(pool: &SqlitePool, id: Uuid) {
+    let released = async {
+        if liquidity_bond::of_order(pool, LEASE, id).await?.is_empty() {
+            return Ok(());
+        }
+        let node = liquidity_bond::node().await?;
+        liquidity_bond::release_all(pool, &*node, LEASE, id).await
+    };
+    if let Err::<(), MostroError>(e) = released.await {
+        tracing::warn!("lease {id}: bond not released ({e}); the bond pass retries");
+    }
+}
+
+/// Decides one lease bond that is still held, at `now`. See the module documentation for the
+/// rule; in short: back to the buyer unless the bond window has ended, the lease never became
+/// active, and this instance's node sees the channel the seller reported.
+async fn decide_bond(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    id: Uuid,
+    bond: &liquidity_bond::Bond,
+    now: u64,
+) -> Result<(), MostroError> {
+    let (Some(row), Some(lease)) = (
+        offer_by_id(pool, id).await?,
+        lease_by_offer(pool, id).await?,
+    ) else {
+        return liquidity_bond::release(pool, node, bond.id).await;
+    };
+    let window = liquidity_bond::settings().lease_bond_window_secs;
+    let window_over = now
+        >= u64::try_from(bond.created_at)
+            .unwrap_or(0)
+            .saturating_add(window);
+    match row.status.as_str() {
+        // Still waiting for the bond: `bond_step` owns it.
+        BONDING => Ok(()),
+        // The lease is being set up and the seller has reported no channel yet.
+        TAKEN | INVOICED => {
+            if window_over {
+                liquidity_bond::release(pool, node, bond.id).await?;
+            }
+            Ok(())
+        }
+        OPENED | CANCELED => {
+            let Some(reported) = &lease.reported else {
+                // Canceled before the seller reported a channel.
+                return liquidity_bond::release(pool, node, bond.id).await;
+            };
+            if !window_over {
+                return Ok(());
+            }
+            let contract = LeaseContract::parse(&lease.contract)
+                .map_err(|_| broken("a stored lease contract does not parse"))?;
+            let in_graph = liquidity_bond::channels_between(
+                node,
+                &row.offer.seller_node,
+                &lease.buyer_node,
+                contract.terms.capacity_sat,
+            )
+            .await?;
+            let opened = in_graph.contains(reported) && !bond.graph_before.contains(reported);
+            if !opened {
+                return liquidity_bond::release(pool, node, bond.id).await;
+            }
+            let taken = liquidity_bond::slash(
+                pool,
+                node,
+                bond.id,
+                &row.seller_identity,
+                &row.seller_trade_pubkey,
+                now,
+            )
+            .await?;
+            if taken {
+                // Tell the seller it is owed; it answers with an invoice.
+                let seller = stored_key(&row.seller_trade_pubkey)?;
+                enqueue_order_msg(None, Some(id), Action::LeaseBondClaim, None, seller, None).await;
+            }
+            Ok(())
+        }
+        // Active, complete, or never taken: nothing the buyer owes.
+        _ => liquidity_bond::release(pool, node, bond.id).await,
+    }
+}
+
+/// The part of the bond pass that is about leases, at `now`: leases waiting for a bond are
+/// brought forward, and every lease bond still held is decided if it can be.
+pub(crate) async fn bond_pass(
+    pool: &SqlitePool,
+    node: &dyn LightningBackend,
+    now: u64,
+) -> Result<(), MostroError> {
+    let rows = sqlx::query("SELECT id FROM lease_offers WHERE status = ?")
+        .bind(BONDING)
+        .fetch_all(pool)
+        .await
+        .map_err(db_err)?;
+    for row in rows {
+        let id: String = row.try_get("id").map_err(db_err)?;
+        if let Ok(id) = Uuid::parse_str(&id) {
+            bond_step(pool, node, id, now).await?;
+        }
+    }
+
+    let rows = sqlx::query(
+        "SELECT DISTINCT order_id FROM liquidity_bonds \
+         WHERE kind = 'lease' AND state IN ('requested', 'locked')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    for row in rows {
+        let id: String = row.try_get("order_id").map_err(db_err)?;
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        for bond in liquidity_bond::of_order(pool, LEASE, id).await? {
+            if bond.state == liquidity_bond::REQUESTED || bond.state == liquidity_bond::LOCKED {
+                decide_bond(pool, node, id, &bond, now).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many leases wait for a bond: the bond pass has work to do even before a bond exists.
+pub(crate) async fn bonding_count(pool: &SqlitePool) -> Result<i64, MostroError> {
+    let row = sqlx::query("SELECT COUNT(*) AS n FROM lease_offers WHERE status = ?")
+        .bind(BONDING)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    row.try_get("n").map_err(db_err)
+}
+
+/// The seller sends its invoice for a buyer's bond it is owed. Checked here: the sender is the
+/// offer's seller and the claim names this offer's lease. Checked by [`liquidity_bond::claim`]:
+/// the bond was taken and is owed to this seller, and the invoice asks for exactly what is owed.
+async fn lease_bond_claim_action(
+    ctx: &AppContext,
+    msg: Message,
+    event: &UnwrappedMessage,
+) -> Result<(), MostroError> {
+    let pool = ctx.pool();
+    let id = order_id(&msg)?;
+    // Without an invoice it is the instance's own notice, not something to receive.
+    let LeasePayload::Invoice(claim) = lease_payload(&msg)? else {
+        return Err(refuse(CantDoReason::InvalidPayload));
+    };
+    claim
+        .validate()
+        .map_err(|_| refuse(CantDoReason::InvalidInvoice))?;
+    let row = offer_by_id(pool, id)
+        .await?
+        .ok_or(refuse(CantDoReason::NotFound))?;
+    let sender = event.identity.to_hex();
+    if sender != row.seller_identity {
+        return Err(refuse(CantDoReason::IsNotYourOrder));
+    }
+    let lease = lease_by_offer(pool, id)
+        .await?
+        .ok_or(refuse(CantDoReason::NotAllowedByStatus))?;
+    if claim.lease_id != lease.lease_id {
+        return Err(refuse(CantDoReason::InvalidParameters));
+    }
+    liquidity_bond::claim(pool, LEASE, id, &sender, &claim.invoice, now()).await
 }
 
 /// One of the seller's steps after the take: the upfront invoice, the channel report, the
@@ -491,14 +881,23 @@ async fn seller_step(
         None,
     )
     .await;
+    if to == ACTIVE {
+        // The seller says the lease is active: the buyer did its part, and its bond goes back.
+        release_bond_now(pool, id).await;
+    }
     sync_order_event(ctx, id).await;
     Ok(())
 }
 
 /// Cancels a lease offer or a lease that is not active yet. The seller may cancel at any point
-/// before `active`; the buyer once it has taken the offer. Bookkeeping only: the buyer's payment
-/// is locked at the seller's node, which the seller's agent cancels itself (or the payment times
-/// out), so nothing here can keep or move money. The other party is told.
+/// before `active`; the buyer once it has taken the offer. For the lease payment this is
+/// bookkeeping only: it is locked at the seller's node, which the seller's agent cancels itself
+/// (or the payment times out). The other party is told.
+///
+/// A buyer's bond goes back at once, with one exception: when the **buyer** cancels after the
+/// seller reported a channel. That is the case the bond exists for, so the bond stays locked
+/// until the end of its window and is then decided on what this instance's node sees
+/// ([`decide_bond`]).
 pub async fn lease_cancel_action(
     ctx: &AppContext,
     msg: Message,
@@ -526,12 +925,24 @@ pub async fn lease_cancel_action(
         (Some(_), false) => Some(stored_key(&row.seller_trade_pubkey)?),
         (None, _) => None,
     };
-    let moved = {
+    let (moved, after_report) = {
         let mut conn = pool.acquire().await.map_err(db_err)?;
-        advance(&mut conn, id, &[PENDING, TAKEN, INVOICED, OPENED], CANCELED).await?
+        let after_report = advance(&mut conn, id, &[OPENED], CANCELED).await?;
+        let moved = after_report
+            || advance(
+                &mut conn,
+                id,
+                &[PENDING, BONDING, TAKEN, INVOICED],
+                CANCELED,
+            )
+            .await?;
+        (moved, after_report)
     };
     if !moved {
         return Err(refuse(CantDoReason::NotAllowedByStatus));
+    }
+    if !(after_report && is_buyer) {
+        release_bond_now(pool, id).await;
     }
 
     enqueue_order_msg(
@@ -554,7 +965,7 @@ pub async fn lease_cancel_action(
 fn public_status(status: &str) -> Option<LeaseOrderStatus> {
     Some(match status {
         PENDING => LeaseOrderStatus::Pending,
-        TAKEN | INVOICED | OPENED => LeaseOrderStatus::InProgress,
+        BONDING | TAKEN | INVOICED | OPENED => LeaseOrderStatus::InProgress,
         ACTIVE | COMPLETION => LeaseOrderStatus::Success,
         CANCELED => LeaseOrderStatus::Canceled,
         EXPIRED => LeaseOrderStatus::Expired,
@@ -707,8 +1118,9 @@ where
     let rows = sqlx::query(
         "SELECT o.id AS id, o.seller_trade_pubkey AS seller, l.buyer_trade_pubkey AS buyer \
          FROM lease_offers o JOIN leases l ON l.offer_id = o.id \
-         WHERE o.status IN (?, ?, ?) AND l.updated_at <= ?",
+         WHERE o.status IN (?, ?, ?, ?) AND l.updated_at <= ?",
     )
+    .bind(BONDING)
     .bind(TAKEN)
     .bind(INVOICED)
     .bind(OPENED)
@@ -734,9 +1146,11 @@ where
         };
         let moved = {
             let mut conn = pool.acquire().await.map_err(db_err)?;
-            advance(&mut conn, id, &[TAKEN, INVOICED, OPENED], CANCELED).await?
+            advance(&mut conn, id, &[BONDING, TAKEN, INVOICED, OPENED], CANCELED).await?
         };
         if moved {
+            // A bond on a lease that stalled is decided by the bond pass, at the end of its
+            // window, as for a lease the buyer canceled after the seller's report.
             for party in [seller, buyer] {
                 enqueue_order_msg(None, Some(id), Action::Canceled, None, party, None).await;
             }
@@ -1809,13 +2223,429 @@ mod tests {
         assert!(!names_a_lease(&ctx, &no_id).await);
     }
 
-    #[tokio::test]
-    async fn an_offer_that_asks_for_a_buyer_bond_is_refused_until_the_instance_takes_them() {
-        let ctx = ctx().await;
-        let seller = Party::new();
+    // ---- the buyer's bond ---------------------------------------------------------------------
+
+    use crate::app::liquidity_bond::testing;
+    use bipnip_ln::HoldState;
+    use mostro_core::bond::{payout_sat, routing_reserve_sat};
+
+    /// What the buyer of a bonded test lease locks.
+    const BOND: u64 = 50_000;
+    /// The outpoint [`channel`] reports.
+    fn reported() -> String {
+        format!("{}:1", "cd".repeat(32))
+    }
+
+    fn node_of(party: &Party) -> String {
+        party.node_key().to_string()
+    }
+
+    async fn count(party: &Party, action: Action) -> usize {
+        party
+            .inbox()
+            .await
+            .iter()
+            .filter(|kind| kind.action == action)
+            .count()
+    }
+
+    /// One pass over the lease bonds at `at`, on the simulated node every test shares, and the
+    /// node calls and payouts that follow from it.
+    async fn bonds_pass(ctx: &AppContext, at: u64) {
+        let node = testing::shared();
+        bond_pass(ctx.pool(), &*node, at).await.unwrap();
+        liquidity_bond::housekeeping(ctx.pool(), &*node, at)
+            .await
+            .unwrap();
+    }
+
+    async fn bond_state(ctx: &AppContext, id: Uuid) -> String {
+        let bonds = liquidity_bond::of_order(ctx.pool(), LEASE, id)
+            .await
+            .unwrap();
+        assert_eq!(bonds.len(), 1, "one bond per lease");
+        bonds[0].state.clone()
+    }
+
+    /// An offer that asks for a bond, taken: the lease waits for the bond. Returns the order id,
+    /// the contract and the payment hash of the bond invoice the buyer was sent (the simulated
+    /// node's invoices are `lnbcrt1` followed by the hash).
+    async fn bonded_take(
+        ctx: &AppContext,
+        seller: &Party,
+        buyer: &Party,
+    ) -> (Uuid, LeaseContract, String) {
         let mut offer = seller.offer();
-        offer.bond_sat = 50_000;
-        // The terms themselves are valid; it is this instance that takes no lease bond.
+        offer.bond_sat = BOND;
+        seller
+            .send(
+                ctx,
+                None,
+                Action::LeaseOffer,
+                Some(LeasePayload::Offer(offer.clone())),
+            )
+            .await
+            .unwrap();
+        let id = seller.inbox().await.pop().unwrap().id.unwrap();
+        let contract = buyer.contract(&offer, 2_000_000);
+        buyer
+            .send(
+                ctx,
+                Some(id),
+                Action::TakeLease,
+                Some(LeasePayload::Take(buyer.take(&contract))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status(ctx, id).await, BONDING);
+        let invoices: Vec<_> = buyer
+            .inbox()
+            .await
+            .into_iter()
+            .filter(|kind| kind.action == Action::LeaseBondInvoice)
+            .collect();
+        assert_eq!(invoices.len(), 1, "one bond invoice");
+        let Some(Payload::Lease(LeasePayload::Invoice(invoice))) = &invoices[0].payload else {
+            panic!("not an invoice");
+        };
+        assert_eq!(invoice.lease_id, contract.id());
+        invoice.validate().unwrap();
+        let hash = invoice.invoice.strip_prefix("lnbcrt1").unwrap().to_string();
+        (id, contract, hash)
+    }
+
+    /// A bonded lease with its bond locked and the seller's channel reported.
+    async fn bonded_opened(
+        ctx: &AppContext,
+        seller: &Party,
+        buyer: &Party,
+    ) -> (Uuid, LeaseContract, String) {
+        let (id, contract, hash) = bonded_take(ctx, seller, buyer).await;
+        testing::shared().pay(&hash);
+        bonds_pass(ctx, now()).await;
+        assert_eq!(status(ctx, id).await, TAKEN);
+        for (action, payload) in [
+            (Action::LeaseInvoice, invoice(&contract)),
+            (Action::LeaseChannelOpened, channel(&contract)),
+        ] {
+            seller
+                .send(ctx, Some(id), action, Some(payload))
+                .await
+                .unwrap();
+        }
+        assert_eq!(status(ctx, id).await, OPENED);
+        assert_eq!(bond_state(ctx, id).await, liquidity_bond::LOCKED);
+        (id, contract, hash)
+    }
+
+    /// One bond pass just after the bond window of a lease taken now.
+    async fn window_end(ctx: &AppContext) {
+        let window = liquidity_bond::settings().lease_bond_window_secs;
+        bonds_pass(ctx, now() + window + 1).await;
+    }
+
+    fn claim_of(contract: &LeaseContract, invoice: &str) -> Option<LeasePayload> {
+        Some(LeasePayload::Invoice(LeaseInvoice {
+            lease_id: contract.id(),
+            invoice: invoice.to_string(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_take_with_a_bond_reaches_the_seller_only_once_the_bond_is_locked() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, contract, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        assert_eq!(node.hold(&hash), Some(HoldState::Open));
+        // The seller knows nothing yet, the buyer has no seller key yet, and the seller cannot
+        // act on a take it was never sent.
+        assert_eq!(count(&seller, Action::TakeLease).await, 0);
+        assert_eq!(count(&buyer, Action::TradePubkey).await, 0);
+        let early = seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseInvoice,
+                Some(invoice(&contract)),
+            )
+            .await;
+        assert_eq!(refused(early), CantDoReason::NotAllowedByStatus);
+        // Not paid: nothing moves, and no second invoice is sent.
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, BONDING);
+        assert_eq!(count(&buyer, Action::LeaseBondInvoice).await, 1);
+
+        node.pay(&hash);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, TAKEN);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(count(&seller, Action::TakeLease).await, 1);
+        assert_eq!(count(&seller, Action::TradePubkey).await, 1);
+        // The buyer's answer carries the request id of its take.
+        let answers: Vec<_> = buyer
+            .inbox()
+            .await
+            .into_iter()
+            .filter(|kind| kind.action == Action::TradePubkey)
+            .collect();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].request_id, Some(7));
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::LOCKED);
+
+        // The lease runs as any other; when the seller says it is active the bond goes back.
+        for (action, payload) in [
+            (Action::LeaseInvoice, Some(invoice(&contract))),
+            (Action::LeaseChannelOpened, Some(channel(&contract))),
+            (Action::LeaseActive, None),
+        ] {
+            assert_eq!(node.hold(&hash), Some(HoldState::Accepted));
+            seller.send(&ctx, Some(id), action, payload).await.unwrap();
+        }
+        assert_eq!(status(&ctx, id).await, ACTIVE);
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Canceled));
+        // Nothing is owed to the seller, whatever the graph shows later.
+        node.announce(&node_of(&seller), &node_of(&buyer), 2_000_000, &reported());
+        bonds_pass(&ctx, now() + 400_000).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(count(&seller, Action::LeaseBondClaim).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_bond_that_is_not_paid_cancels_the_lease_before_the_seller_is_asked() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        bonds_pass(&ctx, now() + BOND_PAY_WINDOW_SECS - 30).await;
+        assert_eq!(status(&ctx, id).await, BONDING);
+        bonds_pass(&ctx, now() + BOND_PAY_WINDOW_SECS + 1).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Canceled));
+        assert_eq!(count(&seller, Action::TakeLease).await, 0);
+        for party in [&seller, &buyer] {
+            assert_eq!(count(party, Action::Canceled).await, 1);
+        }
+
+        // The buyer changes its mind while the bond is awaited, with the bond already paid.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        node.pay(&hash);
+        buyer
+            .send(&ctx, Some(id), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Canceled));
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(count(&seller, Action::TakeLease).await, 0);
+
+        // The node lets the payment go before it was seen locked: canceled as well.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        node.time_out(&hash);
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        assert_eq!(count(&seller, Action::TakeLease).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_buyer_that_walks_away_from_an_open_channel_loses_its_bond_to_the_seller() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let window = liquidity_bond::settings().lease_bond_window_secs;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, contract, hash) = bonded_opened(&ctx, &seller, &buyer).await;
+        node.announce(&node_of(&seller), &node_of(&buyer), 2_000_000, &reported());
+
+        // The buyer cancels instead of releasing the preimage. The bond is not given back at
+        // once, and not taken before its window ends either.
+        buyer
+            .send(&ctx, Some(id), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(status(&ctx, id).await, CANCELED);
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::LOCKED);
+        bonds_pass(&ctx, now() + window - 30).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::LOCKED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Accepted));
+        assert_eq!(count(&seller, Action::LeaseBondClaim).await, 0);
+
+        bonds_pass(&ctx, now() + window + 1).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::SLASHED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Settled));
+        // The seller is told once, without a payload.
+        bonds_pass(&ctx, now() + window + 60).await;
+        let notices: Vec<_> = seller
+            .inbox()
+            .await
+            .into_iter()
+            .filter(|kind| kind.action == Action::LeaseBondClaim)
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].payload.is_none());
+
+        // Only the seller can claim it, for this lease, and it is paid once.
+        let (claim, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let by_buyer = buyer
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondClaim,
+                claim_of(&contract, &claim),
+            )
+            .await;
+        assert_eq!(refused(by_buyer), CantDoReason::IsNotYourOrder);
+        let mut other = contract.clone();
+        other.created_at += 1;
+        let elsewhere = seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondClaim,
+                claim_of(&other, &claim),
+            )
+            .await;
+        assert_eq!(refused(elsewhere), CantDoReason::InvalidParameters);
+        let empty = seller
+            .send(&ctx, Some(id), Action::LeaseBondClaim, None)
+            .await;
+        assert_eq!(refused(empty), CantDoReason::InvalidPayload);
+        seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondClaim,
+                claim_of(&contract, &claim),
+            )
+            .await
+            .unwrap();
+        bonds_pass(&ctx, now()).await;
+        bonds_pass(&ctx, now()).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::PAID);
+        let payments: Vec<_> = node
+            .sent()
+            .into_iter()
+            .filter(|(sent, _)| sent == &claim)
+            .collect();
+        assert_eq!(payments, vec![(claim, routing_reserve_sat(BOND) * 1_000)]);
+
+        // A lease that just stalls after the seller's report ends the same way.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_opened(&ctx, &seller, &buyer).await;
+        node.announce(&node_of(&seller), &node_of(&buyer), 2_000_000, &reported());
+        bonds_pass(&ctx, now() + window + 1).await;
+        assert_eq!(status(&ctx, id).await, OPENED);
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::SLASHED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Settled));
+    }
+
+    #[tokio::test]
+    async fn a_sellers_word_alone_never_takes_the_buyers_bond() {
+        let ctx = ctx().await;
+        let node = testing::shared();
+        let window = liquidity_bond::settings().lease_bond_window_secs;
+        // The seller reports a channel that this instance's node never sees.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_opened(&ctx, &seller, &buyer).await;
+        buyer
+            .send(&ctx, Some(id), Action::Cancel, None)
+            .await
+            .unwrap();
+        window_end(&ctx).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Canceled));
+        assert_eq!(count(&seller, Action::LeaseBondClaim).await, 0);
+        let (claim, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let grab = seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondClaim,
+                Some(LeasePayload::Invoice(LeaseInvoice {
+                    lease_id: lease_by_offer(ctx.pool(), id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .lease_id,
+                    invoice: claim,
+                })),
+            )
+            .await;
+        assert_eq!(refused(grab), CantDoReason::IsNotYourOrder);
+
+        // The channel it reports was there before the bond was locked.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, contract, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        node.announce(&node_of(&seller), &node_of(&buyer), 2_000_000, &reported());
+        node.pay(&hash);
+        bonds_pass(&ctx, now()).await;
+        for (action, payload) in [
+            (Action::LeaseInvoice, invoice(&contract)),
+            (Action::LeaseChannelOpened, channel(&contract)),
+        ] {
+            seller
+                .send(&ctx, Some(id), action, Some(payload))
+                .await
+                .unwrap();
+        }
+        window_end(&ctx).await;
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+
+        // A channel between the two nodes, but not of the contract's capacity, or not at the
+        // outpoint the seller reported.
+        for (capacity, outpoint) in [(1_999_999, reported()), (2_000_000, "0ther:0".to_string())] {
+            let (seller, buyer) = (Party::new(), Party::new());
+            let (id, _, _) = bonded_opened(&ctx, &seller, &buyer).await;
+            node.announce(&node_of(&seller), &node_of(&buyer), capacity, &outpoint);
+            window_end(&ctx).await;
+            assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        }
+
+        // The seller itself cancels after reporting: the bond goes back at once.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_opened(&ctx, &seller, &buyer).await;
+        node.announce(&node_of(&seller), &node_of(&buyer), 2_000_000, &reported());
+        seller
+            .send(&ctx, Some(id), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+        assert_eq!(node.hold(&hash), Some(HoldState::Canceled));
+
+        // The lease ends before the seller reported anything: back at once as well.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, hash) = bonded_take(&ctx, &seller, &buyer).await;
+        node.pay(&hash);
+        bonds_pass(&ctx, now()).await;
+        buyer
+            .send(&ctx, Some(id), Action::Cancel, None)
+            .await
+            .unwrap();
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::RELEASED);
+
+        // While the node cannot be asked, a bond that needs the graph is not decided.
+        let (seller, buyer) = (Party::new(), Party::new());
+        let (id, _, _) = bonded_opened(&ctx, &seller, &buyer).await;
+        let blind = testing::MockNode::new();
+        blind.set_down(true);
+        assert!(bond_pass(ctx.pool(), &*blind, now() + window + 1)
+            .await
+            .is_err());
+        assert_eq!(bond_state(&ctx, id).await, liquidity_bond::LOCKED);
+    }
+
+    #[tokio::test]
+    async fn a_bond_above_the_instances_limit_and_the_instances_own_bond_messages_are_refused() {
+        let ctx = ctx().await;
+        let (seller, buyer) = (Party::new(), Party::new());
+        let mut offer = seller.offer();
+        // The terms themselves allow this bond; the instance's limit is a million satoshi.
+        offer.min_capacity_sat = 2_000_000;
+        offer.bond_sat = 1_500_000;
         offer.validate().unwrap();
         let result = seller
             .send(
@@ -1826,5 +2656,28 @@ mod tests {
             )
             .await;
         assert_eq!(refused(result), CantDoReason::OutOfRangeSatsAmount);
+
+        // Nobody but the instance sends a bond invoice, and a lease without a bond owes none.
+        let (id, contract) = taken(&ctx, &seller, &buyer).await;
+        assert_eq!(status(&ctx, id).await, TAKEN);
+        let (claim, _) = testing::invoice(payout_sat(BOND) * 1_000, 3_600);
+        let forged = seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondInvoice,
+                claim_of(&contract, &claim),
+            )
+            .await;
+        assert_eq!(refused(forged), CantDoReason::InvalidAction);
+        let grab = seller
+            .send(
+                &ctx,
+                Some(id),
+                Action::LeaseBondClaim,
+                claim_of(&contract, &claim),
+            )
+            .await;
+        assert_eq!(refused(grab), CantDoReason::IsNotYourOrder);
     }
 }

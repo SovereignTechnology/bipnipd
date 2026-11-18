@@ -49,6 +49,8 @@ use uuid::Uuid;
 
 /// A bond of a ring member.
 pub const RING: &str = "ring";
+/// The bond of a lease's buyer.
+pub const LEASE: &str = "lease";
 
 /// The invoice was sent; the payment has not arrived.
 pub const REQUESTED: &str = "requested";
@@ -82,13 +84,23 @@ pub struct LiquiditySettings {
     /// payments for up to the ring's window.
     #[serde(default)]
     pub bonds: bool,
-    /// The largest bond a ring on this instance may ask of each member, in satoshi.
+    /// The largest bond a ring on this instance may ask of each member, or a lease of its
+    /// buyer, in satoshi.
     #[serde(default = "default_max_bond_sat")]
     pub max_bond_sat: u64,
+    /// How long a lease buyer's bond may stay locked, in seconds, counted from the take: the
+    /// time the lease has to become active. One minute to 48 hours; 48 hours by default, the
+    /// longest a lease's own hold invoice lives.
+    #[serde(default = "default_lease_bond_window_secs")]
+    pub lease_bond_window_secs: u64,
 }
 
 fn default_max_bond_sat() -> u64 {
     1_000_000
+}
+
+fn default_lease_bond_window_secs() -> u64 {
+    48 * 3_600
 }
 
 impl Default for LiquiditySettings {
@@ -96,6 +108,7 @@ impl Default for LiquiditySettings {
         LiquiditySettings {
             bonds: false,
             max_bond_sat: default_max_bond_sat(),
+            lease_bond_window_secs: default_lease_bond_window_secs(),
         }
     }
 }
@@ -113,7 +126,13 @@ static SETTINGS: OnceLock<LiquiditySettings> = OnceLock::new();
 pub fn parse_settings(toml_text: &str) -> Result<LiquiditySettings, MostroError> {
     let file: SettingsFile = toml::from_str(toml_text)
         .map_err(|e| MostroInternalErr(ServiceError::IOError(format!("[liquidity]: {e}"))))?;
-    Ok(file.liquidity.unwrap_or_default())
+    let settings = file.liquidity.unwrap_or_default();
+    if !(60..=default_lease_bond_window_secs()).contains(&settings.lease_bond_window_secs) {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "[liquidity]: lease_bond_window_secs must be 60 to 172800".to_string(),
+        )));
+    }
+    Ok(settings)
 }
 
 /// Reads and keeps the `[liquidity]` section. Called once, when the settings file is loaded.
@@ -134,13 +153,38 @@ pub fn settings() -> LiquiditySettings {
 pub fn settings() -> LiquiditySettings {
     SETTINGS.get().cloned().unwrap_or(LiquiditySettings {
         bonds: true,
-        max_bond_sat: default_max_bond_sat(),
+        ..LiquiditySettings::default()
     })
 }
 
 /// True when an order asking each member for `bond_sat` may be taken on under `settings`.
 pub fn allowed(settings: &LiquiditySettings, bond_sat: u64) -> bool {
     bond_sat == 0 || (settings.bonds && bond_sat <= settings.max_bond_sat)
+}
+
+/// Chains on which this instance may take bonds while the bond code awaits its owner's read.
+const BOND_TEST_NETWORKS: [&str; 4] = ["regtest", "testnet", "testnet4", "signet"];
+
+/// Why this instance must not start, if `settings` turn bonds on and the node is on a chain
+/// outside [`BOND_TEST_NETWORKS`]. `networks` are the node's chains (LND `GetInfo`); none
+/// known (Cashu mode, no node asked) fails closed. Bonds put members' payments on this
+/// instance's node, so until the bond code is read they stay on test chains.
+pub fn bonds_startup_refusal(settings: &LiquiditySettings, networks: &[String]) -> Option<String> {
+    if !settings.bonds {
+        return None;
+    }
+    match networks.first() {
+        Some(network) if BOND_TEST_NETWORKS.contains(&network.as_str()) => None,
+        Some(network) => Some(format!(
+            "[liquidity].bonds = true is refused on {network}: bonds run only on regtest, \
+             testnet, testnet4 or signet until the bond code has been read. Set bonds = false."
+        )),
+        None => Some(
+            "[liquidity].bonds = true is refused: the node's chain is not known, and bonds run \
+             only on regtest, testnet, testnet4 or signet. Set bonds = false."
+                .to_string(),
+        ),
+    }
 }
 
 #[cfg(not(test))]
@@ -1740,6 +1784,28 @@ mod tests {
     }
 
     #[test]
+    fn bonds_are_refused_off_test_chains() {
+        let off = LiquiditySettings::default();
+        let on = LiquiditySettings {
+            bonds: true,
+            ..LiquiditySettings::default()
+        };
+        let chain = |name: &str| vec![name.to_string()];
+        for name in ["regtest", "testnet", "testnet4", "signet"] {
+            assert_eq!(bonds_startup_refusal(&on, &chain(name)), None, "{name}");
+        }
+        for name in ["mainnet", "bitcoin", "Mainnet", "", "simnet"] {
+            assert!(bonds_startup_refusal(&on, &chain(name)).is_some(), "{name}");
+        }
+        assert!(bonds_startup_refusal(&on, &[]).is_some());
+        // Only the first chain counts, as for dev fees.
+        assert!(bonds_startup_refusal(&on, &["mainnet".into(), "regtest".into()]).is_some());
+        // Bonds off: nothing is refused anywhere.
+        assert_eq!(bonds_startup_refusal(&off, &chain("mainnet")), None);
+        assert_eq!(bonds_startup_refusal(&off, &[]), None);
+    }
+
+    #[test]
     fn bonds_are_off_unless_the_settings_turn_them_on() {
         let absent = parse_settings("[mostro]\nfee = 0.0\n").unwrap();
         assert_eq!(absent, LiquiditySettings::default());
@@ -1758,6 +1824,13 @@ mod tests {
 
         // A misspelt key is an error, not a silent default.
         assert!(parse_settings("[liquidity]\nbond = true\n").is_err());
+
+        // The lease bond window: 48 hours unless set, and never outside a minute to 48 hours.
+        assert_eq!(on.lease_bond_window_secs, 172_800);
+        let short = parse_settings("[liquidity]\nlease_bond_window_secs = 120\n").unwrap();
+        assert_eq!(short.lease_bond_window_secs, 120);
+        assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 59\n").is_err());
+        assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 172801\n").is_err());
     }
 
     #[tokio::test]
