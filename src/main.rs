@@ -14,6 +14,7 @@ pub mod price;
 pub mod publish;
 pub mod rpc;
 pub mod scheduler;
+pub mod sealed; // bipnip: hold-invoice preimages sealed at rest
 pub mod spam_gate;
 pub mod util;
 
