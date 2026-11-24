@@ -1223,6 +1223,30 @@ pub async fn find_held_invoices(pool: &SqlitePool) -> Result<Vec<Order>, MostroE
     Ok(order)
 }
 
+/// bipnip (upstream #1078): true while the order holding the hold invoice `hash` (hex) is one
+/// [`find_held_invoices`] selects, so a subscription to it that ends is made again
+/// (`crate::lightning::watch::keep_watching`). Keep the two conditions the same.
+pub async fn hold_invoice_still_watched(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<bool, MostroError> {
+    sqlx::query_scalar::<_, bool>(
+        r#"
+          SELECT EXISTS(
+            SELECT 1
+            FROM orders
+            WHERE hash = ?1
+              AND ((invoice_held_at != 0 AND status IN ('active', 'fiat-sent', 'dispute'))
+                OR (status IN ('waiting-payment', 'waiting-buyer-invoice') AND hash IS NOT NULL))
+          )
+        "#,
+    )
+    .bind(hash)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// Orders whose trade escrow is a paid hold invoice approaching the point
 /// where the daemon must act before LND does: LND auto-cancels an accepted
 /// hold invoice `invoices.holdexpirydelta` blocks before the HTLC's CLTV
@@ -3906,6 +3930,67 @@ mod tests {
     }
 
     // -- Tests for find_held_invoices --
+
+    /// bipnip (#1078): an invoice is watched again exactly while the startup resubscribe would
+    /// pick its order up.
+    #[tokio::test]
+    async fn hold_invoice_still_watched_agrees_with_find_held_invoices() {
+        let pool = setup_orders_db().await.unwrap();
+        let statuses = [
+            "pending",
+            "waiting-buyer-invoice",
+            "waiting-payment",
+            "active",
+            "fiat-sent",
+            "dispute",
+            "settled-hold-invoice",
+            "success",
+            "canceled",
+        ];
+        let mut rows = Vec::new();
+        for (n, status) in statuses.iter().enumerate() {
+            for held_at in [0_i64, 1_700_001_000] {
+                let id = uuid::Uuid::new_v4();
+                let hash = format!("{:064x}", n * 2 + usize::from(held_at != 0));
+                sqlx::query(
+                    r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                            amount, fiat_code, fiat_amount, created_at, expires_at,
+                            failed_payment, payment_attempts, dev_fee, dev_fee_paid,
+                            invoice_held_at, hash)
+                    VALUES (?1, 'sell', 'ev1', ?2, 0, 'lightning',
+                            100000, 'USD', 100, 1700000000, 1700086400,
+                            0, 0, 0, 0, ?3, ?4)"#,
+                )
+                .bind(id)
+                .bind(status)
+                .bind(held_at)
+                .bind(&hash)
+                .execute(&pool)
+                .await
+                .unwrap();
+                rows.push((id, hash, *status, held_at));
+            }
+        }
+        let held: Vec<uuid::Uuid> = super::find_held_invoices(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|order| order.id)
+            .collect();
+        assert!(!held.is_empty());
+        for (id, hash, status, held_at) in rows {
+            assert_eq!(
+                super::hold_invoice_still_watched(&pool, &hash)
+                    .await
+                    .unwrap(),
+                held.contains(&id),
+                "{status} with invoice_held_at {held_at}"
+            );
+        }
+        assert!(!super::hold_invoice_still_watched(&pool, &"ff".repeat(32))
+            .await
+            .unwrap());
+    }
 
     #[tokio::test]
     async fn test_find_held_invoices_returns_active_with_held_at() {

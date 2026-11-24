@@ -23,28 +23,70 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Watches one hold invoice for as long as it matters.
 ///
 /// `subscribe` streams the invoice's states into the sender it is given, and returns when its
-/// stream ends (`Ok`) or fails (`Err`). Every state goes on to `out`.
+/// stream ends (`Ok`) or fails (`Err`). Every state goes on to `out`. When a stream ends, the
+/// invoice is subscribed again after a backoff that doubles up to [`MAX_BACKOFF`] (and starts
+/// over once a subscription answers), unless:
+/// - the last state seen was final (settled or canceled);
+/// - `still_wanted` says nothing waits on the invoice any more (its order or bond left the
+///   states the startup resubscribe selects);
+/// - nobody reads `out` any more.
 pub async fn keep_watching<S, SF, W, WF>(
     hash: Vec<u8>,
     out: Sender<InvoiceMessage>,
     mut subscribe: S,
-    _still_wanted: W,
-    _first_backoff: Duration,
+    mut still_wanted: W,
+    first_backoff: Duration,
 ) where
     S: FnMut(Vec<u8>, Sender<InvoiceMessage>) -> SF,
     SF: Future<Output = Result<(), String>>,
     W: FnMut() -> WF,
     WF: Future<Output = bool>,
 {
-    let (tx, mut rx) = channel(100);
-    let forward = async {
-        while let Some(message) = rx.recv().await {
-            if out.send(message).await.is_err() {
-                return;
+    let hash_hex = crate::util::bytes_to_string(&hash);
+    let mut backoff = first_backoff;
+    loop {
+        let (tx, mut rx) = channel(100);
+        // The forwarder owns the receiver: once it stops, the subscriber's next send fails.
+        let out_now = out.clone();
+        let forward = async move {
+            let out = out_now;
+            let (mut answered, mut last) = (false, None);
+            while let Some(message) = rx.recv().await {
+                answered = true;
+                last = Some(message.state);
+                if out.send(message).await.is_err() {
+                    return (answered, last, false);
+                }
             }
+            (answered, last, true)
+        };
+        let (result, (answered, last, read)) = tokio::join!(subscribe(hash.clone(), tx), forward);
+        if !read {
+            return;
         }
-    };
-    let _ = tokio::join!(subscribe(hash, tx), forward);
+        if matches!(last, Some(InvoiceState::Settled | InvoiceState::Canceled)) {
+            return;
+        }
+        if !still_wanted().await {
+            tracing::info!(
+                "hold invoice {hash_hex}: nothing waits on it any more; not watched again"
+            );
+            return;
+        }
+        if answered {
+            backoff = first_backoff;
+        }
+        match result {
+            Ok(()) => tracing::warn!(
+                "hold invoice {hash_hex}: its subscription ended; subscribing again in {backoff:?}"
+            ),
+            Err(e) => tracing::warn!(
+                "hold invoice {hash_hex}: its subscription failed ({e}); subscribing again in {backoff:?}"
+            ),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
 }
 
 #[cfg(test)]

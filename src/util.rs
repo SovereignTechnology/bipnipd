@@ -1900,21 +1900,50 @@ pub async fn show_cashu_escrow_request(
 
 // Create function to reuse in case of resubscription
 pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result<(), MostroError> {
-    let mut ln_client_invoices = lightning::LndConnector::new().await?;
+    let ln_client_invoices = lightning::LndConnector::new().await?;
     let (tx, mut rx) = channel(100);
-
-    let invoice_task = {
-        async move {
-            let _ = ln_client_invoices
-                .subscribe_invoice(hash, tx)
-                .await
-                .map_err(|e| e.to_string());
-        }
-    };
-    tokio::spawn(invoice_task);
 
     // Arc clone db pool to safe use across threads
     let pool = get_db_pool();
+
+    // bipnip (upstream #1078): the subscription is made again whenever its stream ends (an LND
+    // restart ends them all), for as long as the order is one the startup resubscribe selects.
+    let invoice_task = {
+        let mut first = Some(ln_client_invoices);
+        let subscribe = move |hash: Vec<u8>, tx| {
+            let connector = first.take();
+            async move {
+                let mut ln = match connector {
+                    Some(ln) => ln,
+                    None => lightning::LndConnector::new()
+                        .await
+                        .map_err(|e| e.to_string())?,
+                };
+                ln.subscribe_invoice(hash, tx)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let watched_pool = pool.clone();
+        let hash_hex = bytes_to_string(&hash);
+        let still_wanted = move || {
+            let pool = watched_pool.clone();
+            let hash_hex = hash_hex.clone();
+            async move {
+                crate::db::hold_invoice_still_watched(pool.as_ref(), &hash_hex)
+                    .await
+                    .unwrap_or(true)
+            }
+        };
+        lightning::watch::keep_watching(
+            hash,
+            tx,
+            subscribe,
+            still_wanted,
+            lightning::watch::FIRST_BACKOFF,
+        )
+    };
+    tokio::spawn(invoice_task);
 
     let subs = {
         async move {

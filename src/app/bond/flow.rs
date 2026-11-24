@@ -841,16 +841,46 @@ pub async fn bond_invoice_subscribe(
     hash: Vec<u8>,
     request_id: Option<u64>,
 ) -> Result<(), MostroError> {
-    let mut ln_client = LndConnector::new().await?;
+    let ln_client = LndConnector::new().await?;
     let (tx, mut rx) = channel::<InvoiceMessage>(100);
 
-    tokio::spawn(async move {
-        if let Err(e) = ln_client.subscribe_invoice(hash, tx).await {
-            warn!("Bond invoice subscriber ended with error: {e}");
-        }
-    });
-
     let pool = crate::config::settings::get_db_pool();
+
+    // bipnip (upstream #1078): the subscription is made again whenever its stream ends (an LND
+    // restart ends them all), for as long as the bond is requested or locked.
+    {
+        let mut first = Some(ln_client);
+        let subscribe = move |hash: Vec<u8>, tx| {
+            let connector = first.take();
+            async move {
+                let mut ln = match connector {
+                    Some(ln) => ln,
+                    None => LndConnector::new().await.map_err(|e| e.to_string())?,
+                };
+                ln.subscribe_invoice(hash, tx)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let watched_pool = pool.clone();
+        let hash_hex = bytes_to_string(&hash);
+        let still_wanted = move || {
+            let pool = watched_pool.clone();
+            let hash_hex = hash_hex.clone();
+            async move {
+                super::db::bond_hold_still_watched(pool.as_ref(), &hash_hex)
+                    .await
+                    .unwrap_or(true)
+            }
+        };
+        tokio::spawn(crate::lightning::watch::keep_watching(
+            hash,
+            tx,
+            subscribe,
+            still_wanted,
+            crate::lightning::watch::FIRST_BACKOFF,
+        ));
+    }
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

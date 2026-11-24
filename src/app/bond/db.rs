@@ -112,6 +112,21 @@ pub async fn find_active_bonds(
         .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
 }
 
+/// bipnip (upstream #1078): true while the bond whose hold invoice is `hash` (hex) is one
+/// [`find_active_bonds`] selects, so a subscription to it that ends is made again
+/// (`crate::lightning::watch::keep_watching`). Keep the two conditions the same.
+pub async fn bond_hold_still_watched(pool: &Pool<Sqlite>, hash: &str) -> Result<bool, MostroError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM bonds WHERE hash = ? AND state IN (?, ?))",
+    )
+    .bind(hash)
+    .bind(BondState::Requested.to_string())
+    .bind(BondState::Locked.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 /// List the still-outstanding bonds attached to a single order. Phase 1
 /// uses this to release every bond on any order exit path (cancel,
 /// release, admin actions, scheduler timeouts).
