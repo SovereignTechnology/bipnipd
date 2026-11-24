@@ -1424,7 +1424,10 @@ async fn bond_pass(
     // The verdict reads this node's graph: not before the node says it is synced, or a channel
     // gossip has not brought yet would look missing. The ring stays open until then.
     // A node that cannot be asked at all fails the verdict below, as before.
-    let lagging = matches!(node.node_info().await, Ok(info) if !info.synced);
+    let info = node.node_info().await;
+    let lagging = matches!(&info, Ok(info) if !info.synced);
+    let height = info.as_ref().ok().map(|info| info.block_height);
+    let grace = liquidity_bond::settings().bond_grace_blocks;
     for id in overdue {
         if liquidity_bond::of_order(pool, RING, id).await?.is_empty() {
             continue;
@@ -1432,6 +1435,14 @@ async fn bond_pass(
         if lagging {
             tracing::info!("ring {id}: its bonds wait until this node is synced");
             continue;
+        }
+        // And for a few blocks more: a channel opened near the end of the window is announced
+        // only after six confirmations, and gossip takes time to bring it.
+        if let Some(height) = height {
+            if !liquidity_bond::grace_over(pool, RING, id, height, grace).await? {
+                tracing::info!("ring {id}: its bonds wait {grace} blocks past the window");
+                continue;
+            }
         }
         judge(pool, node, id, now).await?;
         close(pool, id, PARTIAL).await?;
