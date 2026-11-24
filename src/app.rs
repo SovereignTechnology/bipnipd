@@ -710,15 +710,22 @@ pub async fn run(ctx: AppContext, ln_client: &mut LndConnector) -> Result<()> {
                 else {
                     continue;
                 };
-                let result = handle_message_action(
-                    &action,
-                    message.clone(),
-                    &unwrapped,
-                    my_keys,
-                    ln_client,
-                    &ctx,
-                )
-                .await;
+                // bipnip (#1102): the daemon's key is not a solver over Nostr.
+                let result =
+                    match daemon_key::refusal(&ctx, &action, &message, &unwrapped, my_keys).await {
+                        Some(reason) => Err(MostroError::MostroCantDo(reason).into()),
+                        None => {
+                            handle_message_action(
+                                &action,
+                                message.clone(),
+                                &unwrapped,
+                                my_keys,
+                                ln_client,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    };
                 finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }
@@ -760,8 +767,15 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
                 else {
                     continue;
                 };
-                let result =
-                    dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
+                // bipnip (#1102): the daemon's key is not a solver over Nostr.
+                let result = match daemon_key::refusal(&ctx, &action, &message, &unwrapped, my_keys)
+                    .await
+                {
+                    Some(reason) => Err(MostroError::MostroCantDo(reason).into()),
+                    None => {
+                        dispatch_cashu(&action, message.clone(), &unwrapped, my_keys, &ctx).await
+                    }
+                };
                 finalize_dispatch(&ctx, result, message, unwrapped, &action, gate).await;
             }
         }

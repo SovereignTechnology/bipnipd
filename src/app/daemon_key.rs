@@ -11,20 +11,50 @@
 //! takes the daemon key, as does cancelling an order nobody has taken yet (draining the book).
 
 use crate::app::context::AppContext;
+use crate::util::get_order;
 use mostro_core::error::CantDoReason;
 use mostro_core::message::{Action, Message};
+use mostro_core::order::{Order, Status};
 use mostro_core::transport::UnwrappedMessage;
 use nostr_sdk::prelude::Keys;
 
 /// Why a relay event is refused before any handler sees it; `None` lets it through.
+///
+/// Only events that carry the daemon's key, as identity or as trade key, are looked at. Taking a
+/// dispute answers `invalid_pubkey`, as for any key that is not a solver; settling, and cancelling
+/// anything already taken, answer `not_authorized`.
 pub async fn refusal(
-    _ctx: &AppContext,
-    _action: &Action,
-    _msg: &Message,
-    _event: &UnwrappedMessage,
-    _my_keys: &Keys,
+    ctx: &AppContext,
+    action: &Action,
+    msg: &Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
 ) -> Option<CantDoReason> {
-    None
+    let node = my_keys.public_key();
+    if event.identity != node && event.sender != node {
+        return None;
+    }
+    match action {
+        Action::AdminTakeDispute => Some(CantDoReason::InvalidPubkey),
+        Action::AdminSettle => Some(CantDoReason::NotAuthorized),
+        Action::AdminCancel => match get_order(msg, ctx.pool()).await {
+            Ok(order) if nobody_took(&order) => None,
+            _ => Some(CantDoReason::NotAuthorized),
+        },
+        _ => None,
+    }
+}
+
+/// The orders `admin_cancel_action` lets the daemon key cancel: not taken, so no escrow and no
+/// dispute (`Pending`, `WaitingTakerBond`, `WaitingMakerBond`).
+fn nobody_took(order: &Order) -> bool {
+    [
+        Status::Pending,
+        Status::WaitingTakerBond,
+        Status::WaitingMakerBond,
+    ]
+    .into_iter()
+    .any(|status| order.check_status(status).is_ok())
 }
 
 #[cfg(test)]
