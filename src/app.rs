@@ -3,6 +3,7 @@
 
 // Application context (dependency injection)
 pub mod context;
+pub mod daemon_key; // bipnip: over Nostr the daemon's key is not a solver (upstream #1102)
 pub mod daemon_state; // key/value operator state (maintenance mode)
 pub mod health; // LND sync tracking, fail-closed maintenance, health checks
 pub mod maintenance; // maintenance (drain) mode flag + drain counters
