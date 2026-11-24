@@ -45,12 +45,12 @@ pub async fn keep_watching<S, SF, W, WF>(
     let hash_hex = crate::util::bytes_to_string(&hash);
     let mut backoff = first_backoff;
     loop {
-        let (tx, mut rx) = channel(100);
+        let (tx, mut rx) = channel::<InvoiceMessage>(100);
         // The forwarder owns the receiver: once it stops, the subscriber's next send fails.
         let out_now = out.clone();
         let forward = async move {
             let out = out_now;
-            let (mut answered, mut last) = (false, None);
+            let (mut answered, mut last): (bool, Option<InvoiceState>) = (false, None);
             while let Some(message) = rx.recv().await {
                 answered = true;
                 last = Some(message.state);
