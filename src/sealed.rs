@@ -139,8 +139,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(seal_stored(&pool).await.unwrap(), 1);
+        // Orders keep their id as a UUID, as the daemon writes it.
         let stored: String = sqlx::query_scalar("SELECT preimage FROM orders WHERE id = ?")
-            .bind(order.to_string())
+            .bind(order)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -149,7 +150,7 @@ mod tests {
         // Once sealed, nothing more to do; an order without a preimage keeps none.
         assert_eq!(seal_stored(&pool).await.unwrap(), 0);
         let none: Option<String> = sqlx::query_scalar("SELECT preimage FROM orders WHERE id = ?")
-            .bind(empty.to_string())
+            .bind(empty)
             .fetch_one(&pool)
             .await
             .unwrap();
