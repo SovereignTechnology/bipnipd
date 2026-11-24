@@ -1,4 +1,5 @@
 pub mod invoice;
+pub mod watch; // bipnip: hold invoices stay watched when LND restarts (upstream #1078)
 
 use crate::config::settings::Settings;
 use crate::lightning::invoice::decode_invoice;
