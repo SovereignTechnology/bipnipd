@@ -707,9 +707,17 @@ async fn decide_bond(
                 return Ok(());
             }
             // The verdict reads this node's graph: not before the node says it is synced, or a
-            // channel gossip has not brought yet would look missing.
-            if matches!(node.node_info().await, Ok(info) if !info.synced) {
+            // channel gossip has not brought yet would look missing; and not for a few blocks
+            // more, since a channel is announced only after six confirmations.
+            let info = node.node_info().await;
+            if matches!(&info, Ok(info) if !info.synced) {
                 return Ok(());
+            }
+            if let Ok(info) = &info {
+                let grace = liquidity_bond::settings().bond_grace_blocks;
+                if !liquidity_bond::grace_over(pool, LEASE, id, info.block_height, grace).await? {
+                    return Ok(());
+                }
             }
             let contract = LeaseContract::parse(&lease.contract)
                 .map_err(|_| broken("a stored lease contract does not parse"))?;

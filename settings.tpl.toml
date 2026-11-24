@@ -481,3 +481,7 @@ lnd_resynced_clear_after = 300
 # # order's own rules (fewest channels, least capacity) are checked against
 # # this node's graph for every taker.
 # require_seller_in_graph = true
+# # Blocks a bond verdict waits once its window has ended, before this node's
+# # graph is read: a channel is announced only after six confirmations, and
+# # gossip takes time. 0 to 144; 6 by default.
+# bond_grace_blocks = 6

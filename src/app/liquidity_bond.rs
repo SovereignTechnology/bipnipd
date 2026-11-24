@@ -97,10 +97,19 @@ pub struct LiquiditySettings {
     /// default: a seller's node is one others can see.
     #[serde(default = "default_true")]
     pub require_seller_in_graph: bool,
+    /// How many blocks a bond verdict waits once its window has ended, before this instance's
+    /// graph is read: a channel opened near the end is announced only after six confirmations,
+    /// and gossip takes time to bring it. 0 to 144; 6 by default.
+    #[serde(default = "default_bond_grace_blocks")]
+    pub bond_grace_blocks: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_bond_grace_blocks() -> u32 {
+    6
 }
 
 fn default_max_bond_sat() -> u64 {
@@ -118,6 +127,7 @@ impl Default for LiquiditySettings {
             max_bond_sat: default_max_bond_sat(),
             lease_bond_window_secs: default_lease_bond_window_secs(),
             require_seller_in_graph: true,
+            bond_grace_blocks: default_bond_grace_blocks(),
         }
     }
 }
@@ -139,6 +149,11 @@ pub fn parse_settings(toml_text: &str) -> Result<LiquiditySettings, MostroError>
     if !(60..=default_lease_bond_window_secs()).contains(&settings.lease_bond_window_secs) {
         return Err(MostroInternalErr(ServiceError::IOError(
             "[liquidity]: lease_bond_window_secs must be 60 to 172800".to_string(),
+        )));
+    }
+    if settings.bond_grace_blocks > 144 {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "[liquidity]: bond_grace_blocks must be 0 to 144".to_string(),
         )));
     }
     Ok(settings)
@@ -164,8 +179,44 @@ pub fn settings() -> LiquiditySettings {
     SETTINGS.get().cloned().unwrap_or(LiquiditySettings {
         bonds: true,
         require_seller_in_graph: false,
+        // Verdicts come at the window's end in tests; `grace_over` has tests of its own.
+        bond_grace_blocks: 0,
         ..LiquiditySettings::default()
     })
+}
+
+/// True once a bond verdict on `kind`'s order `order_id` may be given at block `height`: the
+/// first call records `height` as when the verdict fell due, and the verdict waits `grace`
+/// blocks from there. With no grace, at once.
+pub async fn grace_over(
+    pool: &SqlitePool,
+    kind: &str,
+    order_id: Uuid,
+    height: u32,
+    grace: u32,
+) -> Result<bool, MostroError> {
+    if grace == 0 {
+        return Ok(true);
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO liquidity_verdict_waits (kind, order_id, first_height) \
+         VALUES (?, ?, ?)",
+    )
+    .bind(kind)
+    .bind(order_id.to_string())
+    .bind(i64::from(height))
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    let first: i64 = sqlx::query_scalar(
+        "SELECT first_height FROM liquidity_verdict_waits WHERE kind = ? AND order_id = ?",
+    )
+    .bind(kind)
+    .bind(order_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(i64::from(height) >= first.saturating_add(i64::from(grace)))
 }
 
 /// True when an order asking each member for `bond_sat` may be taken on under `settings`.
@@ -1865,6 +1916,38 @@ mod tests {
         assert_eq!(short.lease_bond_window_secs, 120);
         assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 59\n").is_err());
         assert!(parse_settings("[liquidity]\nlease_bond_window_secs = 172801\n").is_err());
+
+        // The verdict's grace: six blocks unless set, at most a day's worth.
+        assert_eq!(on.bond_grace_blocks, 6);
+        let none = parse_settings("[liquidity]\nbond_grace_blocks = 0\n").unwrap();
+        assert_eq!(none.bond_grace_blocks, 0);
+        assert!(parse_settings("[liquidity]\nbond_grace_blocks = 145\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_verdict_waits_its_grace_from_the_block_it_first_fell_due() {
+        let pool = pool().await;
+        let ring = Uuid::new_v4();
+        let lease = Uuid::new_v4();
+        // Due at 100: not before 106, wherever it is asked from.
+        assert!(!grace_over(&pool, RING, ring, 100, 6).await.unwrap());
+        assert!(!grace_over(&pool, RING, ring, 105, 6).await.unwrap());
+        assert!(grace_over(&pool, RING, ring, 106, 6).await.unwrap());
+        assert!(grace_over(&pool, RING, ring, 200, 6).await.unwrap());
+        // Each order counts from its own first call; a lease is not a ring of the same id.
+        assert!(!grace_over(&pool, LEASE, ring, 106, 6).await.unwrap());
+        assert!(!grace_over(&pool, LEASE, lease, 150, 6).await.unwrap());
+        assert!(grace_over(&pool, LEASE, lease, 156, 6).await.unwrap());
+        // No grace: at once, and nothing is recorded.
+        let other = Uuid::new_v4();
+        assert!(grace_over(&pool, RING, other, 1, 0).await.unwrap());
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM liquidity_verdict_waits WHERE order_id = ?")
+                .bind(other.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[tokio::test]
