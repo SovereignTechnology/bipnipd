@@ -563,6 +563,10 @@ payment_retries_interval = 60  # seconds between retries
 
 **Required**: LND connection details. Mostro needs admin macaroon for hold invoice management.
 
+bipnip's fork does not start while the macaroon, `settings.toml`, `.env` or the database can be read
+by another user of the machine, or while the settings directory can be written by one. Give the daemon
+its own copy of the macaroon: `install -m 600 -o <daemon user> admin.macaroon <settings dir>/`.
+
 ---
 
 #### Nostr Configuration

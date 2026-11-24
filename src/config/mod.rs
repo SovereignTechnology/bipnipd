@@ -2,6 +2,7 @@
 pub mod constants;
 pub mod payer_history;
 pub mod secret;
+pub mod secret_files; // bipnip, fork-only: secret files must be owner-only (upstream #1014)
 pub mod settings;
 /// This module provides functionality to manage and initialize settings for the Mostro application.
 /// It includes structures for database, lightning, Nostr, and Mostro settings, as well as functions to initialize and access these settings.

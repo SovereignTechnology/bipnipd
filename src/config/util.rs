@@ -559,6 +559,14 @@ fn load_configuration_file(config_path: Option<String>) -> Result<(), MostroErro
     // Override database URL
     settings.database.url = format!("sqlite://{}", settings_dir.join(DB_FILENAME).display());
 
+    // bipnip, fork-only (upstream #1014): no start while a file holding a secret is open to
+    // other users of this machine.
+    crate::config::secret_files::refuse_loose(
+        &settings_dir,
+        &settings.lightning.lnd_macaroon_file,
+        DB_FILENAME,
+    )?;
+
     // Initialize the global settings variable
     init_mostro_settings(settings)?;
 
