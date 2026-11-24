@@ -1,6 +1,6 @@
 [package]
 name = "mostro"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Francisco Calderón <negrunch@grunch.dev>"]
@@ -71,9 +71,10 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-# bipnip-core main (#9): the mostro-core fork. Mostro's types unchanged, plus node binding, leases
-# and rings (terms, messages, the public order events), rules for takers and liquidity outcomes.
-mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "ef08e969502892499e922a988f84e2168b744ac4", features = ["sqlx"] }
+# bipnip-core with mostro-core v0.17.4 merged: the mostro-core fork. Mostro's types unchanged, plus
+# node binding, leases and rings (terms, messages, the public order events), rules for takers and
+# liquidity outcomes.
+mostro-core = { git = "https://github.com/SovereignTechnology/bipnip-core", rev = "d45f0d86cab8fee0570086941e89e66771ee47a1", features = ["sqlx"] }
 # bipnip: node access for liquidity bonds (hold invoices, payments, graph). The same trait and LND
 # backend the agent uses; inherited escrow keeps its own LndConnector.
 bipnip-ln = { git = "https://github.com/SovereignTechnology/bipnip", rev = "d52d3750b1891e96648209970687945621ad1921", features = ["lnd"] }

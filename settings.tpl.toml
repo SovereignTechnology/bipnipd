@@ -228,8 +228,15 @@ lnd_resynced_clear_after = 300
 # update_interval_seconds = 300
 # max_price_staleness_seconds = 1800
 # # Discard a source whose value deviates more than this % from the median
-# # (only applies with >= 3 sources for a currency).
+# # (with >= 3 sources for a currency). With exactly 2 sources there is no
+# # median: if they differ by more than pair_divergence_pct (default: this
+# # value) % of their mean, the currency is refused and serves
+# # last-known-good until it goes stale.
 # outlier_threshold_pct = 5.0
+# # Optional: tolerance for exactly 2 sources only, defaulting to
+# # outlier_threshold_pct. Loosen it to refuse fewer pairs without widening
+# # the band used with 3 or more sources.
+# # pair_divergence_pct = 5.0
 # # Per-provider request timeout and circuit-breaker (cooldown caps at 30 min).
 # provider_timeout_seconds = 10
 # provider_failure_threshold = 3
@@ -241,6 +248,9 @@ lnd_resynced_clear_after = 300
 # [price.providers.yadio]
 # enabled = true
 # url = "https://api.yadio.io"
+# # Codes Yadio misquotes against an official rate that is the real market
+# # (measured 2026-11-17; docs/PRICE_PROVIDERS.md §6.6 "Two-source currencies").
+# except = ["ALL", "BND", "BTN", "BZD", "JMD", "NPR"]
 #
 # [price.providers.coingecko]
 # enabled = true
@@ -249,15 +259,22 @@ lnd_resynced_clear_after = 300
 # # plans use url = "https://pro-api.coingecko.com/api/v3" (the adapter picks
 # # the matching auth header from the host).
 #
-# # Keyless, CDN-hosted, 300+ currencies incl. CUP at the OFFICIAL rate — so
-# # CUP/MLC are excluded to avoid mixing official with the informal-market
-# # sources (docs/PRICE_PROVIDERS.md §6.6).
+# # Keyless, CDN-hosted, 300+ currencies at the OFFICIAL rate — so codes with
+# # a parallel market (CUP, VES, …) are excluded to avoid mixing official with
+# # informal-market sources (docs/PRICE_PROVIDERS.md §6.6). With only two
+# # sources for a code, a disagreement refuses it: these lists keep the
+# # minor fiats priced. They drift; the price refusal warnings name new ones.
 # [price.providers.currency_api]
 # enabled = true
 # url = "https://currency-api.pages.dev/v1"
 # # Ordered mirrors tried in sequence when `url` fails this tick.
 # fallback_urls = ["https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1"]
-# except = ["CUP", "MLC"]
+# except = [
+#   "CUP", "MLC",
+#   # Parallel markets (measured 2026-11-17); SYP: pre-redenomination units.
+#   "AOA", "BIF", "DZD", "ETB", "GNF", "IQD", "IRR", "LYD", "MWK", "MZN",
+#   "SDG", "SLE", "SYP", "TND", "TTD", "VES", "YER",
+# ]
 #
 # # Keyless, ~28 major fiats, no CUP/MLC. Mid-market (`last`) only.
 # [price.providers.blockchain]
@@ -291,7 +308,9 @@ lnd_resynced_clear_after = 300
 # # §11.9). No network call: each code is quoted at 1:1 with what it is
 # # pegged to. Opt-in: off, the node behaves as today (fixed-price orders in
 # # these codes pass where `fiat_currencies_accepted` allows them;
-# # market-priced ones are refused for lack of a rate).
+# # market-priced ones are refused for lack of a rate). With no market
+# # provider enabled next to it, the legacy `bitcoin_price_api_url` stays in
+# # use for every other currency; enable one above to choose your own.
 # #
 # # Stablecoins, pegged to a fiat. `fa` is in whole coins, priced from the
 # # node's rate for that fiat, so a USDT market order is priced like a USD
@@ -348,8 +367,9 @@ lnd_resynced_clear_after = 300
 # # in the book for at most bond_cltv_delta - hold_invoice_cltv_delta - 144
 # # blocks (144, ~24 h, with the defaults); a longer expiration is cut to that
 # # when the bond locks. Must be above hold_invoice_cltv_delta + 144 and at
-# # most 864.
-# bond_cltv_delta = 432
+# # most 864. Unset, it is hold_invoice_cltv_delta + 288, at most 864 (432
+# # with the shipped 144).
+# # bond_cltv_delta = 432
 
 # Payment-account history / anti-triangulation (docs/PAYER_HISTORY_ANTI_TRIANGULATION.md).
 # Opt-in, disabled by default. Mostro never sees the buyer's payer details:
