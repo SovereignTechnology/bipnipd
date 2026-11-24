@@ -83,6 +83,13 @@ async fn main() -> Result<()> {
         exit(1);
     };
 
+    // bipnip: seal any hold-invoice preimage still stored in cleartext (src/sealed.rs).
+    match sealed::seal_stored(get_db_pool().as_ref()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("sealed {n} hold-invoice preimages stored in cleartext"),
+        Err(e) => tracing::error!("could not seal the preimages stored in cleartext: {e}"),
+    }
+
     // Serbero, the dispute assistant: the configured key must be a read-only
     // solver. Registered here when it has no row yet; any other kind of row
     // is left untouched and stops the boot (docs/SOLVER_PERMISSION_LEVELS.md).

@@ -11,7 +11,7 @@
 //! daemon's key strands the sealed preimages: settle or cancel what is held first.
 
 use mostro_core::error::{MostroError, MostroError::MostroInternalErr, ServiceError};
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{nip44, Keys};
 
 /// The prefix of a sealed value.
 pub const PREFIX: &str = "sealed1:";
@@ -36,19 +36,125 @@ fn keys() -> Result<&'static Keys, MostroError> {
 }
 
 /// `preimage` sealed for `row`.
-pub fn seal(_row: &str, preimage: &str) -> Result<String, MostroError> {
-    let _ = keys()?;
-    Ok(preimage.to_string())
+pub fn seal(row: &str, preimage: &str) -> Result<String, MostroError> {
+    let keys = keys()?;
+    let sealed = nip44::encrypt(
+        keys.secret_key(),
+        &keys.public_key(),
+        format!("{row}\n{preimage}"),
+        nip44::Version::V2,
+    )
+    .map_err(sealing_error)?;
+    Ok(format!("{PREFIX}{sealed}"))
 }
 
 /// The preimage `stored` for `row` holds: opened, or as it is when it was stored before sealing.
-pub fn open(_row: &str, stored: &str) -> Result<String, MostroError> {
-    Ok(stored.to_string())
+pub fn open(row: &str, stored: &str) -> Result<String, MostroError> {
+    let Some(sealed) = stored.strip_prefix(PREFIX) else {
+        return Ok(stored.to_string());
+    };
+    let keys = keys()?;
+    let plain =
+        nip44::decrypt(keys.secret_key(), &keys.public_key(), sealed).map_err(sealing_error)?;
+    match plain.split_once('\n') {
+        Some((bound, preimage)) if bound == row => Ok(preimage.to_string()),
+        _ => Err(sealing_error(format!("not sealed for {row}"))),
+    }
+}
+
+/// The tables that hold preimages, by the name their rows are sealed under.
+const TABLES: [&str; 3] = ["orders", "bonds", "liquidity_bonds"];
+
+/// Seals every preimage still stored in cleartext, at startup. A row changed meanwhile is left
+/// as it is (compare-and-swap) and read as cleartext, as before. Returns how many were sealed.
+pub async fn seal_stored(pool: &sqlx::SqlitePool) -> Result<u64, MostroError> {
+    use sqlx::Row;
+    let db = |e: sqlx::Error| MostroInternalErr(ServiceError::DbAccessError(e.to_string()));
+    let mut sealed = 0;
+    for table in TABLES {
+        // The table names are the constants above, never input.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT rowid AS r, id, preimage FROM {table} \
+             WHERE preimage IS NOT NULL AND preimage NOT LIKE 'sealed1:%'"
+        )))
+        .fetch_all(pool)
+        .await
+        .map_err(db)?;
+        for row in rows {
+            let rowid: i64 = row.try_get("r").map_err(db)?;
+            let preimage: String = row.try_get("preimage").map_err(db)?;
+            // Orders and anti-abuse bonds keep their id as a UUID, liquidity bonds as text.
+            let id = match row.try_get::<uuid::Uuid, _>("id") {
+                Ok(id) => id.to_string(),
+                Err(_) => row.try_get::<String, _>("id").map_err(db)?,
+            };
+            let value = seal(&format!("{table}/{id}"), &preimage)?;
+            let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE {table} SET preimage = ? WHERE rowid = ? AND preimage = ?"
+            )))
+            .bind(&value)
+            .bind(rowid)
+            .bind(&preimage)
+            .execute(pool)
+            .await
+            .map_err(db)?;
+            sealed += done.rows_affected();
+        }
+    }
+    Ok(sealed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preimages_stored_in_cleartext_are_sealed_at_startup() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let order = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid, preimage)
+            VALUES (?1, 'sell', 'ev1', 'active', 0, 'bank', 100000, 'USD', 100,
+                    1700000000, 1700086400, 0, 0, 0, 0, ?2)"#,
+        )
+        .bind(order)
+        .bind(PREIMAGE)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let empty = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO orders (id, kind, event_id, status, premium, payment_method,
+                    amount, fiat_code, fiat_amount, created_at, expires_at,
+                    failed_payment, payment_attempts, dev_fee, dev_fee_paid)
+            VALUES (?1, 'sell', 'ev2', 'pending', 0, 'bank', 100000, 'USD', 100,
+                    1700000000, 1700086400, 0, 0, 0, 0)"#,
+        )
+        .bind(empty)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(seal_stored(&pool).await.unwrap(), 1);
+        let stored: String = sqlx::query_scalar("SELECT preimage FROM orders WHERE id = ?")
+            .bind(order.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(stored.starts_with(PREFIX));
+        assert_eq!(open(&format!("orders/{order}"), &stored).unwrap(), PREIMAGE);
+        // Once sealed, nothing more to do; an order without a preimage keeps none.
+        assert_eq!(seal_stored(&pool).await.unwrap(), 0);
+        let none: Option<String> = sqlx::query_scalar("SELECT preimage FROM orders WHERE id = ?")
+            .bind(empty.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(none, None);
+    }
 
     const PREIMAGE: &str = "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00";
 

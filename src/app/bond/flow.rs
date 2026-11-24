@@ -192,7 +192,11 @@ pub async fn request_taker_bond(
 
     let mut bond = Bond::new_requested(order.id, taker_pubkey.to_string(), BondRole::Taker, amount);
     bond.hash = Some(bytes_to_string(&hash));
-    bond.preimage = Some(bytes_to_string(&preimage));
+    // bipnip: sealed at rest (src/sealed.rs).
+    bond.preimage = Some(crate::sealed::seal(
+        &format!("bonds/{}", bond.id),
+        &bytes_to_string(&preimage),
+    )?);
     bond.payment_request = Some(invoice_resp.payment_request.clone());
     bond.taker_identity = Some(taker_ctx.identity.clone());
     bond.taker_trade_index = Some(taker_ctx.trade_index);
@@ -364,7 +368,11 @@ pub async fn request_maker_bond(
 
     let mut bond = Bond::new_requested(order.id, maker_pubkey.to_string(), BondRole::Maker, amount);
     bond.hash = Some(bytes_to_string(&hash));
-    bond.preimage = Some(bytes_to_string(&preimage));
+    // bipnip: sealed at rest (src/sealed.rs).
+    bond.preimage = Some(crate::sealed::seal(
+        &format!("bonds/{}", bond.id),
+        &bytes_to_string(&preimage),
+    )?);
     bond.payment_request = Some(invoice_resp.payment_request.clone());
     // No `taker_*` context on a maker bond: those columns describe the
     // deferred take snapshot of a concurrent taker bond and stay NULL here.
