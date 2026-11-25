@@ -460,20 +460,23 @@ pub async fn request(
         })
         .await
         .map_err(node_err)?;
+    // bipnip: sealed at rest (src/sealed.rs), for the row it goes in.
+    let id = Uuid::new_v4();
+    let sealed = crate::sealed::seal(&format!("liquidity_bonds/{id}"), &preimage)?;
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO liquidity_bonds \
          (id, kind, order_id, payer_identity, payer_trade_pubkey, amount_sat, payment_hash, \
           preimage, invoice, state, node_done, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(id.to_string())
     .bind(req.kind)
     .bind(req.order_id.to_string())
     .bind(req.payer_identity)
     .bind(req.payer_trade_pubkey)
     .bind(amount)
     .bind(&payment_hash)
-    .bind(&preimage)
+    .bind(&sealed)
     .bind(&invoice)
     .bind(REQUESTED)
     .bind(now as i64)
@@ -687,7 +690,9 @@ async fn finish_slash(
     node: &dyn LightningBackend,
     bond: &Bond,
 ) -> Result<(), MostroError> {
-    let seen = match node.settle_hold_invoice(&bond.preimage).await {
+    // bipnip: sealed at rest (src/sealed.rs).
+    let preimage = crate::sealed::open(&format!("liquidity_bonds/{}", bond.id), &bond.preimage)?;
+    let seen = match node.settle_hold_invoice(&preimage).await {
         Ok(()) => Some(HoldState::Settled),
         Err(BackendError::Rejected(_)) => node.hold_invoice_state(&bond.payment_hash).await.ok(),
         Err(_) => None,

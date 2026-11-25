@@ -824,8 +824,9 @@ async fn slash_one<L: SettleLightning + Send>(
     node_share_pct: f64,
     payout_recipient: Option<String>,
 ) -> Result<(), MostroError> {
+    // bipnip: sealed at rest (src/sealed.rs).
     let preimage = match bond.preimage.as_deref() {
-        Some(p) => p,
+        Some(stored) => crate::sealed::open(&format!("bonds/{}", bond.id), stored)?,
         None => {
             warn!(
                 bond_id = %bond.id,
@@ -836,7 +837,7 @@ async fn slash_one<L: SettleLightning + Send>(
         }
     };
 
-    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
+    if let Err(e) = ln_client.settle_hold_invoice(&preimage).await {
         if is_already_settled_error(&e) {
             info!(
                 bond_id = %bond.id,
@@ -1162,14 +1163,16 @@ pub async fn resolve_range_maker_bond_at_close<L: SettleLightning + Send>(
 
     // ≥1 slice slashed: settle the whole HTLC once. Settle BEFORE the CAS so
     // a transient failure leaves the parent retryably `Locked`.
-    let Some(preimage) = parent.preimage.as_deref() else {
+    let Some(stored) = parent.preimage.as_deref() else {
         warn!(
             bond_id = %parent.id,
             "range close: parent bond has no preimage; cannot settle — left Locked"
         );
         return Ok(());
     };
-    if let Err(e) = ln_client.settle_hold_invoice(preimage).await {
+    // bipnip: sealed at rest (src/sealed.rs).
+    let preimage = crate::sealed::open(&format!("bonds/{}", parent.id), stored)?;
+    if let Err(e) = ln_client.settle_hold_invoice(&preimage).await {
         if is_already_settled_error(&e) {
             info!(
                 bond_id = %parent.id,

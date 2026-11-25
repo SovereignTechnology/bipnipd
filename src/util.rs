@@ -1700,7 +1700,11 @@ pub async fn show_hold_invoice(
     };
 
     // Using CRUD to update all fiels
-    order.preimage = Some(bytes_to_string(&preimage));
+    // bipnip: sealed at rest (src/sealed.rs).
+    order.preimage = Some(crate::sealed::seal(
+        &format!("orders/{}", order.id),
+        &bytes_to_string(&preimage),
+    )?);
     order.hash = Some(bytes_to_string(&hash));
     order.status = Status::WaitingPayment.to_string();
     // `taken_at` anchors the waiting-state timeout clock
@@ -2122,8 +2126,10 @@ pub async fn settle_seller_hold_invoice(
     }
 
     // Settling the hold invoice
-    if let Some(preimage) = order.preimage.as_ref() {
-        escrow.settle_hold_invoice(preimage).await?;
+    if let Some(stored) = order.preimage.as_ref() {
+        // bipnip: sealed at rest (src/sealed.rs).
+        let preimage = crate::sealed::open(&format!("orders/{}", order.id), stored)?;
+        escrow.settle_hold_invoice(&preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
         return Err(MostroCantDo(CantDoReason::InvalidInvoice));
