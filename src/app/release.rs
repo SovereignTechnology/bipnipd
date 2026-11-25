@@ -282,6 +282,20 @@ pub async fn check_failure_retries(
     Ok(order)
 }
 
+/// Moves an order out of `fiat-sent` or `dispute` into `settled-hold-invoice`, once (issue #904): true for the
+/// one caller whose compare-and-swap did it, false for any other, however it came to ask.
+async fn claim_release(pool: &Pool<Sqlite>, order_id: uuid::Uuid) -> Result<bool, MostroError> {
+    let moved = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status IN (?, ?)")
+        .bind(Status::SettledHoldInvoice.to_string())
+        .bind(order_id)
+        .bind(Status::FiatSent.to_string())
+        .bind(Status::Dispute.to_string())
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(moved.rows_affected() == 1)
+}
+
 /// Handles the release action for an order, managing the release of funds and subsequent order flow.
 ///
 /// This function is responsible for processing the release of funds in a trade, which is a critical
@@ -378,16 +392,7 @@ pub async fn release_action(
     // compare-and-swap moves the row out of `FiatSent`/`Dispute` may settle;
     // the loser returns without settling, notifying or paying.
     let prior_status = order.status.clone();
-    let claimed = sqlx::query("UPDATE orders SET status = ? WHERE id = ? AND status IN (?, ?)")
-        .bind(Status::SettledHoldInvoice.to_string())
-        .bind(order.id)
-        .bind(Status::FiatSent.to_string())
-        .bind(Status::Dispute.to_string())
-        .execute(pool)
-        .await
-        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?
-        .rows_affected()
-        == 1;
+    let claimed = claim_release(pool, order.id).await?;
     if !claimed {
         tracing::warn!(
             "Order {} release skipped: another release already claimed it",
@@ -2528,6 +2533,37 @@ mod tests {
         }
     }
 
+    /// Issue #904, without the timing: the claim goes to one caller and one only, from `fiat-sent` and from
+    /// `dispute`, and to nobody once the order has moved on.
+    #[tokio::test]
+    async fn claim_release_goes_to_one_caller_only() {
+        let pool = create_test_pool().await;
+        let seller = Keys::generate().public_key();
+        let buyer = Keys::generate().public_key();
+        for from in [Status::FiatSent, Status::Dispute] {
+            let mut order = fiat_sent_sell_order(seller, buyer);
+            order.status = from.to_string();
+            let order = order.create(&pool).await.unwrap();
+            assert!(
+                claim_release(&pool, order.id).await.unwrap(),
+                "the first caller wins from {from:?}"
+            );
+            assert!(
+                !claim_release(&pool, order.id).await.unwrap(),
+                "the second does not"
+            );
+            let moved = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+            assert_eq!(moved.status, Status::SettledHoldInvoice.to_string());
+        }
+        let mut pending = fiat_sent_sell_order(seller, buyer);
+        pending.status = Status::Pending.to_string();
+        let pending = pending.create(&pool).await.unwrap();
+        assert!(
+            !claim_release(&pool, pending.id).await.unwrap(),
+            "an order not yet paid is nobody's to release"
+        );
+    }
+
     /// Issue #904: two concurrent `release` messages for one order must settle
     /// the hold invoice exactly once, and only the winner notifies the buyer.
     #[tokio::test]
@@ -2570,8 +2606,22 @@ mod tests {
             ),
         );
 
-        // Assert: one settle, both callers Ok, one `Released` to the buyer.
-        assert!(a.is_ok() && b.is_ok());
+        // Assert: one settle, one `Released` to the buyer. The caller that loses is told one of two
+        // things, by when it read the order. Before the winner's claim it passes the status check and
+        // loses the compare-and-swap: `Ok`. After it, it sees `settled-hold-invoice` and is refused
+        // like any later release: `NotAllowedByStatus`. Scheduling decides, and the full suite, run
+        // in parallel, tips it either way. Either way it settles and notifies nothing.
+        let fine = |r: &Result<(), MostroError>| {
+            matches!(
+                r,
+                Ok(()) | Err(MostroCantDo(CantDoReason::NotAllowedByStatus))
+            )
+        };
+        assert!(fine(&a) && fine(&b), "a={a:?} b={b:?}");
+        assert!(
+            a.is_ok() || b.is_ok(),
+            "one of them must have released: a={a:?} b={b:?}"
+        );
         assert_eq!(settles.load(std::sync::atomic::Ordering::SeqCst), 1);
         let released = queued_actions_for(order.id)
             .await
