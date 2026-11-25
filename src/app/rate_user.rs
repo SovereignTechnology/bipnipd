@@ -127,7 +127,7 @@ pub async fn update_user_reputation_action(
     // Claim the order-side flag and apply the aggregate in one transaction so a
     // concurrent Rate cannot double-apply, and so a lost claim never mutates
     // the users table. Only the applicable unset flag is written.
-    let mut tx = pool.begin().await.map_err(|e| {
+    let mut tx = crate::db::begin_write(pool).await.map_err(|e| {
         MostroInternalErr(ServiceError::DbAccessError(format!(
             "Failed to begin rating transaction: {e}"
         )))
