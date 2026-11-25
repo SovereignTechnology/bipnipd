@@ -3,6 +3,8 @@
 > liquidity leases and rings and node-bound Nostr identities. It is not affiliated with the Mostro project.
 > Upstream: [MostroP2P/mostro](https://github.com/MostroP2P/mostro), forked at v0.20.2 and tracked release by
 > release. License unchanged: GPL-3.0-or-later. Fork status: M0 (nothing here is ready for real funds).
+> Unlike upstream, the daemon's own key is not a solver over Nostr: work disputes with a solver key added by
+> `admin-add-solver` (upstream #1102). The admin RPC is unchanged.
 
 # Mostro 🧌
 
